@@ -1,0 +1,29 @@
+{
+  "name": "@beibingyangliuying/dsh-zotero",
+  "version": "0.1.0",
+  "description": "External channel helpers for the dsh-autoresearch workbench: local Zotero, arXiv, bibliographic REST, index discovery and journal ranking, shipped as command-line programs that cost nothing on a request that does not call them.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "dsh": ">=0.2.0-rc.2 <0.3.0-0",
+    "node": ">=20"
+  },
+  "exports": {
+    ".": "./tools-dir.js",
+    "./tools-dir": "./tools-dir.js",
+    "./tools/*": "./tools/*",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "test": "node tools/dev/run-selftests.mjs",
+    "test:list": "node tools/dev/run-selftests.mjs --list"
+  },
+  "dependencies": {
+    "@hyzyla/pdfium": "^3.0.0",
+    "pdfjs-dist": "^6.4.299"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/beibingyangliuying/dsh-zotero.git"
+  }
+}
