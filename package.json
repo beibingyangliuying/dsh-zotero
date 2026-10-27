@@ -1,15 +1,17 @@
 {
   "name": "@beibingyangliuying/dsh-zotero",
-  "version": "0.1.0",
-  "description": "External channel helpers for the dsh-autoresearch workbench: local Zotero, arXiv, bibliographic REST, index discovery and journal ranking, shipped as command-line programs that cost nothing on a request that does not call them.",
+  "version": "0.2.0",
+  "description": "External channel helpers for the dsh-autoresearch workbench: local Zotero, arXiv, bibliographic REST, index discovery and journal ranking, shipped as command-line programs behind one discovery tool.",
   "license": "MIT",
   "type": "module",
+  "main": "./plugin.js",
   "engines": {
     "dsh": ">=0.2.0-rc.2 <0.3.0-0",
     "node": ">=20"
   },
   "exports": {
-    ".": "./tools-dir.js",
+    ".": "./plugin.js",
+    "./plugin.js": "./plugin.js",
     "./tools-dir": "./tools-dir.js",
     "./tools/*": "./tools/*",
     "./package.json": "./package.json"
@@ -17,6 +19,11 @@
   "scripts": {
     "test": "node tools/dev/run-selftests.mjs",
     "test:list": "node tools/dev/run-selftests.mjs --list"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
   },
   "dependencies": {
     "@hyzyla/pdfium": "^3.0.0",

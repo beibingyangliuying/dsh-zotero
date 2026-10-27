@@ -1,0 +1,7 @@
+# The row this package mounts in a profile. One row, one tool: the fifteen programs stay programs.
+#
+# `name` is the package name, so Node module resolution finds the entry through `exports["."]`.
+- insert:
+    - id: zotero-channel
+      name: '@beibingyangliuying/dsh-zotero'
+      config: {}
