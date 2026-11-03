@@ -37,7 +37,13 @@ import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { APP_NAME, createWriteGate, getJson, isWriteAccepted, localRequest, mayHaveLanded, reportUnconfirmed } from './zotero-local-api.mjs'
-import { reportFailure } from './refusal.mjs'
+import { reportFailure, reportHelp, wantsHelp } from './refusal.mjs'
+
+const USAGE =
+  'usage: node tools/zotero-link-attachments.mjs --target <directory> [--limit N] [--no-wake] [--write]\n' +
+  '       node tools/zotero-link-attachments.mjs --selftest\n' +
+  '       a dry run unless --write is given. Exit 3 means a link or a delete may have landed: read the\n' +
+  '       key it names before running the conversion again.'
 
 /** Set immediately before a write is sent, so a failure after that point is never called a refusal. */
 let writeAttempted = false
@@ -492,7 +498,9 @@ async function selftest() {
 const isEntryPoint =
   process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 
-if (isEntryPoint) {
+if (isEntryPoint && wantsHelp(process.argv.slice(2))) {
+  process.exitCode = reportHelp(USAGE)
+} else if (isEntryPoint) {
   if (flag('selftest')) {
     process.exit((await selftest()) === 0 ? 0 : 1)
   } else {

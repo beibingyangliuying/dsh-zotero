@@ -56,8 +56,8 @@ const CATALOG = [
   },
   {
     program: 'zotero-collection',
-    purpose: 'list, create, rename or assign collections; every write is a dry run unless --write is given',
-    example: ['--list'],
+    purpose: 'list, show, create, rename or assign collections; every write is a dry run unless --write is given',
+    example: ['--show', 'ABCD1234'],
   },
   {
     program: 'zotero-export',

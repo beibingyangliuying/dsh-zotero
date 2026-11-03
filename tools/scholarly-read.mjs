@@ -23,7 +23,7 @@
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { decodeXml } from './arxiv.mjs'
-import { Refusal, UsageError, reportFailure } from './refusal.mjs'
+import { Refusal, UsageError, reportFailure, reportHelp, wantsHelp } from './refusal.mjs'
 import { chunkText, rankPassages, sliceText } from './zotero-read.mjs'
 import { extractPdfText } from './zotero-pdf.mjs'
 import {
@@ -541,7 +541,9 @@ async function main() {
 
 const isEntryPoint = process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 
-if (isEntryPoint) {
+if (isEntryPoint && wantsHelp(process.argv.slice(2))) {
+  process.exitCode = reportHelp(USAGE)
+} else if (isEntryPoint) {
   main().catch((error) => {
     process.exitCode = reportFailure(error, { usage: USAGE })
   })

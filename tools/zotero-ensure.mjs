@@ -39,7 +39,7 @@ import { existsSync } from 'node:fs'
 import { join, posix, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { localOrigin, localRequest } from './zotero-local-api.mjs'
-import { UsageError, reportFailure } from './refusal.mjs'
+import { UsageError, reportFailure, reportHelp, wantsHelp } from './refusal.mjs'
 
 const DEFAULT_WAIT_SECONDS = 30
 const MAX_WAIT_SECONDS = 300
@@ -55,7 +55,7 @@ const PROBE_TIMEOUT_MS = 2000
 const GRACE_WHEN_RUNNING_MS = 5000
 
 const USAGE =
-  'Usage: node tools/zotero-ensure.mjs [--wait 30] [--dry-run] [--help]\n' +
+  'usage: node tools/zotero-ensure.mjs [--wait 30] [--dry-run] [--help]\n' +
   '       0 = the library answers | 1 = it does not, and this command cannot make it | 2 = usage\n'
 
 /** The Windows uninstall keys, HKLM as well as HKCU: an install can be per-user or per-machine. */
@@ -415,7 +415,9 @@ async function main() {
 const isEntryPoint =
   process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 
-if (isEntryPoint) {
+if (isEntryPoint && wantsHelp(process.argv.slice(2))) {
+  process.exitCode = reportHelp(USAGE)
+} else if (isEntryPoint) {
   main()
     .then((code) => process.exit(code))
     .catch((error) => {

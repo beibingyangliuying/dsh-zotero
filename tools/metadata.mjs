@@ -63,7 +63,7 @@
 // Exit codes: 0 answered, including zero results | 1 the request or the response failed | 2 usage.
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { Refusal, UsageError, reportFailure } from './refusal.mjs'
+import { Refusal, UsageError, reportFailure, reportHelp, wantsHelp } from './refusal.mjs'
 
 const OPENALEX_URL = 'https://api.openalex.org'
 const CROSSREF_URL = 'https://api.crossref.org'
@@ -1154,7 +1154,9 @@ const isEntryPoint = process.argv[1] !== undefined && resolve(process.argv[1]) =
 // NOT `await main()`: this module is the entry point AND it dynamically imports its own self-test,
 // which statically imports this file back. A pending top-level await here would make that cycle wait
 // on itself - the self-test body never runs and the process exits 13 with only a warning.
-if (isEntryPoint) {
+if (isEntryPoint && wantsHelp(process.argv.slice(2))) {
+  process.exitCode = reportHelp(USAGE)
+} else if (isEntryPoint) {
   main().catch((error) => {
     process.exitCode = reportFailure(error, { usage: USAGE })
   })

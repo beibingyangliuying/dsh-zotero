@@ -34,7 +34,7 @@
 import { APP_NAME, createWriteGate, mayHaveLanded, patchItem, readItem, reportUnconfirmed } from './zotero-local-api.mjs'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { Refusal, UsageError, reportFailure } from './refusal.mjs'
+import { Refusal, UsageError, reportFailure, reportHelp, wantsHelp } from './refusal.mjs'
 
 /** Set immediately before the PATCH is sent, so a failure after that point is never called a refusal. */
 let writeAttempted = false
@@ -333,7 +333,9 @@ async function main() {
 const isEntryPoint =
   process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 
-if (isEntryPoint) {
+if (isEntryPoint && wantsHelp(process.argv.slice(2))) {
+  process.exitCode = reportHelp(USAGE)
+} else if (isEntryPoint) {
   main().catch((error) => {
     const code = reportFailure(error, { usage: USAGE })
     if (code === 1 && writeAttempted && !error.refused) {

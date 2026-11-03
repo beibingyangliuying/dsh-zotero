@@ -28,7 +28,7 @@
 import { APP_NAME, createWriteGate, fieldNamesForType, mayHaveLanded, normalizeTags, patchItem, readItem, reportUnconfirmed } from './zotero-local-api.mjs'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { Refusal, UsageError, reportFailure } from './refusal.mjs'
+import { Refusal, UsageError, reportFailure, reportHelp, wantsHelp } from './refusal.mjs'
 
 /** The reader, named in a `fix` line only as an absolute, runnable path. */
 const READ_TOOL = fileURLToPath(new URL('./zotero-read.mjs', import.meta.url))
@@ -329,7 +329,9 @@ function fieldsNotReadBack(after, changes, tagChange) {
 const isEntryPoint =
   process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 
-if (isEntryPoint) {
+if (isEntryPoint && wantsHelp(process.argv.slice(2))) {
+  process.exitCode = reportHelp(USAGE)
+} else if (isEntryPoint) {
   main().catch((error) => {
     const code = reportFailure(error, { usage: USAGE })
     if (code === 1 && writeAttempted && !error.refused) {

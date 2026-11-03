@@ -79,7 +79,7 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { UsageError, reportFailure } from './refusal.mjs'
+import { UsageError, reportFailure, reportHelp, wantsHelp } from './refusal.mjs'
 import { APP_NAME, childrenOf, createWriteGate, isWriteAccepted, localRequest, patchItem, readItem, visibleText } from './zotero-local-api.mjs'
 
 /** The tag prefix that records which top-level section a note explains. */
@@ -1780,7 +1780,9 @@ async function main() {
 
 const isEntryPoint = process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 
-if (isEntryPoint) {
+if (isEntryPoint && wantsHelp(process.argv.slice(2))) {
+  process.exitCode = reportHelp(USAGE)
+} else if (isEntryPoint) {
   main().catch((error) => {
     const code = reportFailure(error, { usage: USAGE })
     if (code === 1 && writeAttempted && !error.refused) {

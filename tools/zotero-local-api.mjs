@@ -358,10 +358,31 @@ async function sendWithRetry(method, path, options) {
     try {
       return await sendOnce(method, path, options)
     } catch (error) {
-      if (attempt >= attempts || !RETRYABLE_CODES.has(error.code)) throw error
+      if (!RETRYABLE_CODES.has(error.code)) throw error
+      if (attempt >= attempts) throw exhaustedRead(method, error)
       await delay(RETRY_DELAYS_MS[attempt - 1] ?? RETRY_DELAYS_MS[RETRY_DELAYS_MS.length - 1])
     }
   }
+}
+
+/**
+ * The sentence a read gets when every attempt was dropped.
+ *
+ * A bare `read ECONNRESET` names neither the address nor a next action, and the reader cannot tell it
+ * from a bug in the tool. Only reads are translated: a write that failed after it was sent is
+ * unconfirmed, not refused, and that distinction lives in the callers.
+ *
+ * @param {string} method HTTP method.
+ * @param {Error & {code?: string}} error The last connection failure.
+ * @returns {Error} A {@link Refusal} for a read, the original error otherwise.
+ */
+function exhaustedRead(method, error) {
+  if (method !== 'GET') return error
+  const { host, port } = localOrigin()
+  return new Refusal(
+    `the local API at ${host}:${port} dropped ${READ_ATTEMPTS} connections in a row (${error.code}).`,
+    { fix: 'The library is running but resetting: run the command again, and restart Zotero if it keeps doing this.' },
+  )
 }
 
 /**

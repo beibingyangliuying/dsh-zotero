@@ -51,7 +51,14 @@ import {
   reportUnconfirmed,
   serverInfo,
 } from './zotero-local-api.mjs'
-import { UsageError, reportFailure } from './refusal.mjs'
+import { UsageError, reportFailure, reportHelp, wantsHelp } from './refusal.mjs'
+
+const USAGE =
+  'usage: node tools/zotero-write.mjs --arxiv <id> [--collection <key> ...] [--force] [--write]\n' +
+  '       node tools/zotero-write.mjs --doi <doi> [--collection <key> ...] [--force] [--write]\n' +
+  '       node tools/zotero-write.mjs --selftest\n' +
+  '       a dry run unless --write is given; a record already in the library is left alone unless\n' +
+  '       --force is passed. Exit 3 means a record may exist: search for it before creating it again.'
 
 /** Set immediately before the create is sent, so a failure after that point is never called a refusal. */
 let writeAttempted = false
@@ -527,7 +534,9 @@ const isEntryPoint = process.argv[1] !== undefined && resolvePath(process.argv[1
 
 // Only act when this file IS the command: the unit self-test imports the pure parts above, and an
 // import must not create a record.
-if (isEntryPoint) {
+if (isEntryPoint && wantsHelp(process.argv.slice(2))) {
+  process.exitCode = reportHelp(USAGE)
+} else if (isEntryPoint) {
   try {
     if (flag('selftest')) await selftest()
     else await run()

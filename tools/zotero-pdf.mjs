@@ -41,7 +41,7 @@ import { PDFiumLibrary } from '@hyzyla/pdfium'
 import { childrenOf, filePathFrom, localRequest } from './zotero-local-api.mjs'
 import { findPassages, readItemOrRefuse, sliceText } from './zotero-read.mjs'
 import { romanToNumber } from './zotero-section-note.mjs'
-import { Refusal, UsageError, reportFailure } from './refusal.mjs'
+import { Refusal, UsageError, reportFailure, reportHelp, wantsHelp } from './refusal.mjs'
 
 export { filePathFrom }
 
@@ -431,7 +431,9 @@ async function main() {
 
 const isEntryPoint = process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 
-if (isEntryPoint) {
+if (isEntryPoint && wantsHelp(process.argv.slice(2))) {
+  process.exitCode = reportHelp(USAGE)
+} else if (isEntryPoint) {
   main().catch((error) => {
     process.exitCode = reportFailure(error, { usage: USAGE })
   })

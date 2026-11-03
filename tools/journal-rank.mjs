@@ -90,7 +90,7 @@ import { readFileSync, readdirSync, existsSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { normalizeDoi, plainText } from './metadata.mjs'
-import { UsageError, reportFailure } from './refusal.mjs'
+import { UsageError, reportFailure, reportHelp, wantsHelp } from './refusal.mjs'
 
 const PROVIDER_URL = 'https://www.easyscholar.cc/open/getPublicationRank'
 const CROSSREF_URL = 'https://api.crossref.org'
@@ -496,7 +496,9 @@ const isEntryPoint = process.argv[1] !== undefined && resolve(process.argv[1]) =
 // NOT `await main()`: this module is the entry point AND it dynamically imports its own self-test,
 // which statically imports this file back. A pending top-level await here would make that cycle wait
 // on itself and the self-test body would never run.
-if (isEntryPoint) {
+if (isEntryPoint && wantsHelp(process.argv.slice(2))) {
+  process.exitCode = reportHelp(USAGE)
+} else if (isEntryPoint) {
   main().catch((error) => {
     // `process.exitCode`, not `process.exit()`: measured on this machine, exiting while a piped stderr
     // write is still pending makes libuv assert (`!(handle->flags & UV_HANDLE_CLOSING)`, async.c:76) and

@@ -130,3 +130,33 @@ export function reportFailure(error, { usage = '', write = (text) => console.err
   write(`\n${refusalLines(error, { width }).join('\n')}`)
   return 1
 }
+
+/**
+ * Whether this call asked for the usage block rather than for work.
+ *
+ * A program that answers `--help` with `unrecognised argument '--help'` has told its reader that the
+ * one flag every command line offers is not one it has. Both spellings are accepted because both are
+ * what a reader tries.
+ *
+ * @param {string[]} argv The arguments, without the interpreter and the script.
+ * @returns {boolean} True when help was asked for.
+ */
+export function wantsHelp(argv) {
+  return argv.includes('--help') || argv.includes('-h')
+}
+
+/**
+ * Print a program's usage block and return the exit code 0.
+ *
+ * The block is the one a usage error prints, minus the error: the request succeeded, so the exit code
+ * says so. The absolute-path line comes along, so `--help` is as actionable as a malformed call.
+ *
+ * @param {string} usage The usage block.
+ * @returns {number} 0.
+ */
+export function reportHelp(usage) {
+  const lines = usage ? [usage] : []
+  if (ENTRY_LINE) lines.push(ENTRY_LINE)
+  console.log(lines.join('\n'))
+  return 0
+}

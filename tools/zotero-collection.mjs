@@ -55,7 +55,7 @@ import {
   readItem,
   reportUnconfirmed,
 } from './zotero-local-api.mjs'
-import { UsageError, reportFailure } from './refusal.mjs'
+import { Refusal, UsageError, reportFailure, reportHelp, wantsHelp } from './refusal.mjs'
 
 /** Set immediately before a write is sent, so a failure after that point is never called a refusal. */
 let writeAttempted = false
@@ -95,6 +95,7 @@ export function nextCollections(current, collectionKey, { remove = false } = {})
 
 const USAGE =
   'usage: node tools/zotero-collection.mjs --list\n' +
+  '       node tools/zotero-collection.mjs --show <key>\n' +
   '       node tools/zotero-collection.mjs --create "<name>" [--parent <key>] [--write]\n' +
   '       node tools/zotero-collection.mjs --rename <key> --name "<new name>" [--write]\n' +
   '       node tools/zotero-collection.mjs --assign <itemKey> --collection <key> [--remove] [--write]'
@@ -114,8 +115,9 @@ function parseArgs(argv) {
         break
       case '--create':
       case '--rename':
+      case '--show':
       case '--assign':
-        if (options.mode) throw new UsageError('pass one of --list/--create/--rename/--assign')
+        if (options.mode) throw new UsageError('pass one of --list/--show/--create/--rename/--assign')
         options.mode = flag.slice(2)
         take(flag, next, flag === '--assign' ? 'item' : 'value')
         index += 1
@@ -167,6 +169,37 @@ async function runList() {
     }
   }
   walk('', 0)
+}
+
+async function runShow(options) {
+  const rows = await allCollections()
+  const row = rows.find((candidate) => candidate.key === options.value)
+  if (!row) {
+    throw new Refusal(`no collection ${options.value} in this library.`, {
+      fix: 'Run --list for the keys it does have.',
+    })
+  }
+  const byKey = new Map(rows.map((each) => [each.key, each]))
+  const name = (key) => `${byKey.get(key)?.data?.name ?? '(unnamed)'} (${key})`
+  const parentOf = (each) => normalizeCollections(each.data?.parentCollection)[0] ?? ''
+  const parentKey = parentOf(row)
+  // Walk up to the root, guarding against a malformed tree rather than looping on it.
+  const path = [name(row.key)]
+  const seen = new Set([row.key])
+  for (let key = parentKey; key && !seen.has(key); key = parentOf(byKey.get(key) ?? {})) {
+    seen.add(key)
+    path.unshift(name(key))
+  }
+  const children = rows.filter((each) => parentOf(each) === row.key)
+  console.log(`collection : ${row.key}`)
+  console.log(`name       : ${row.data?.name ?? '(unnamed)'}`)
+  console.log(`parent     : ${parentKey ? name(parentKey) : '(library root)'}`)
+  console.log(`items      : ${row.meta?.numItems ?? 0}  directly in this collection`)
+  console.log(`path       : ${path.join(' > ')}`)
+  console.log(`children   : ${children.length}`)
+  for (const child of children) {
+    console.log(`             ${child.key}  ${String(child.meta?.numItems ?? 0).padStart(5)}  ${child.data?.name ?? '(unnamed)'}`)
+  }
 }
 
 async function runCreate(options) {
@@ -368,14 +401,16 @@ async function runAssign(options) {
 
 async function main() {
   const options = parseArgs(process.argv.slice(2))
-  const runners = { list: runList, create: runCreate, rename: runRename, assign: runAssign }
+  const runners = { list: runList, show: runShow, create: runCreate, rename: runRename, assign: runAssign }
   await runners[options.mode](options)
 }
 
 const isEntryPoint =
   process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 
-if (isEntryPoint) {
+if (isEntryPoint && wantsHelp(process.argv.slice(2))) {
+  process.exitCode = reportHelp(USAGE)
+} else if (isEntryPoint) {
   main().catch((error) => {
     const code = reportFailure(error, { usage: USAGE })
     if (code === 1 && writeAttempted && !error.refused) {
