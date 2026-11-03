@@ -25,6 +25,7 @@ import {
   libraryPrefix,
   localRequest,
   parseLibrary,
+  requireCollection,
 } from './zotero-local-api.mjs'
 import { Refusal, UsageError, reportFailure } from './refusal.mjs'
 
@@ -210,6 +211,7 @@ async function requestExport(path) {
 
 /** A collection's records, paged, in library order. */
 async function collectionKeys(options) {
+  await requireCollection(options.collection, { library: options.library })
   const rows = []
   for (let start = 0; start < COLLECTION_CAP; start += COLLECTION_PAGE) {
     const path =

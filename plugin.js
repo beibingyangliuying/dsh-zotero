@@ -25,82 +25,89 @@ export const inject = ['tools']
 
 const PACKAGE_ROOT = fileURLToPath(new URL('./', import.meta.url))
 
-/** One program's public face: what it is for, and one command that actually works. */
+/**
+ * One program's public face: what it is for, and one command that actually works.
+ *
+ * `example` is the `args` array itself, one element per word, so the catalog prints a call a reader can
+ * paste back verbatim. It was a single string once, printed inside `["..."]`: a multi-word value then
+ * looked like one argument, and pasting it back answered `unrecognised argument '--search "seismic
+ * risk" --limit 10'` - an example of the usage that the usage text refused.
+ */
 const CATALOG = [
   {
     program: 'zotero-read',
     purpose: 'read the library: full-text search, one item or note, BM25 passages, collections, item-type schema, change cursor, DOI lookup',
-    example: '--search "seismic risk" --limit 10',
+    example: ['--search', 'seismic risk', '--limit', '10'],
   },
   {
     program: 'zotero-write',
     purpose: 'add one item by DOI or arXiv id, optionally filing it into a collection; a dry run unless --write is given',
-    example: '--doi 10.1000/xyz --write',
+    example: ['--doi', '10.1000/xyz', '--write'],
   },
   {
     program: 'zotero-edit',
     purpose: "change an item's fields or tags; a dry run unless --write is given",
-    example: '--item ABCD1234 --set title="A new title" --write',
+    example: ['--item', 'ABCD1234', '--set', 'title=A new title', '--write'],
   },
   {
     program: 'zotero-remark',
     purpose: 'replace the single remark line of an item whose old value you must state; a dry run unless --write is given',
-    example: '--item ABCD1234 --new-line "rate: 2" --expect-current "rate: 3" --write',
+    example: ['--item', 'ABCD1234', '--new-line', 'rate: 2', '--expect-current', 'rate: 3', '--write'],
   },
   {
     program: 'zotero-collection',
     purpose: 'list, create, rename or assign collections; every write is a dry run unless --write is given',
-    example: '--list',
+    example: ['--list'],
   },
   {
     program: 'zotero-export',
     purpose: 'formatted citations, bibliographies and BibTeX/RIS/CSL-JSON exports, through the library own translators',
-    example: '--item ABCD1234 --format bibtex',
+    example: ['--item', 'ABCD1234', '--format', 'bibtex'],
   },
   {
     program: 'zotero-pdf',
     purpose: 'the attachment side: its outline, its text layer, or a page rendered to an image; rungs are chosen one per call',
-    example: '--item ABCD1234 --extract',
+    example: ['--item', 'ABCD1234', '--extract'],
   },
   {
     program: 'zotero-ensure',
     purpose: 'make the library answer, or say why it will not: probes the local API and starts the application when it is not running',
-    example: '--wait 30',
+    example: ['--wait', '30'],
   },
   {
     program: 'zotero-link-attachments',
     purpose: 'convert stored PDFs into linked files under a target directory; a dry run unless --write is given',
-    example: '--target "D:\\Store"',
+    example: ['--target', 'D:\\Store'],
   },
   {
     program: 'zotero-section-note',
     purpose: 'one explanation note per top-level section: coverage plan, claim, rewrite, retire; writes need --write',
-    example: '--item ABCD1234',
+    example: ['--item', 'ABCD1234'],
   },
   {
     program: 'arxiv',
     purpose: 'the preprint index: its own query syntax, records by id, Atom parsing that refuses to print an error feed as a record',
-    example: "--search 'au:hinton' --max 10",
+    example: ['--search', 'au:hinton', '--max', '10'],
   },
   {
     program: 'metadata',
     purpose: 'bibliographic REST over OpenAlex/Crossref/Unpaywall: identifiers, search, references, citations, open-access lookup, citation formatting',
-    example: '--doi 10.1038/s41586-021-03819-2',
+    example: ['--doi', '10.1038/s41586-021-03819-2'],
   },
   {
     program: 'scholarly',
     purpose: 'discovery across arXiv/OpenAlex/Crossref/Semantic Scholar/PubMed/Europe PMC/DBLP with weighted RRF dedup and a library mark',
-    example: '--search "retrieval augmented generation" --limit 10',
+    example: ['--search', 'retrieval augmented generation', '--limit', '10'],
   },
   {
     program: 'scholarly-read',
     purpose: 'open-access full text by identifier: arXiv HTML, ar5iv, PMC JATS, or an open-access PDF, with outline and passage lookup',
-    example: '--id 10.1038/s41586-021-03819-2 --outline',
+    example: ['--id', '10.1038/s41586-021-03819-2', '--outline'],
   },
   {
     program: 'journal-rank',
     purpose: "one journal's provider reading (partition and rank), by journal name or DOI",
-    example: '--journal "Reliability Engineering & System Safety"',
+    example: ['--journal', 'Reliability Engineering & System Safety'],
   },
 ]
 
@@ -138,7 +145,7 @@ export function catalogText() {
   for (const entry of CATALOG) {
     lines.push(`${entry.program}`)
     lines.push(`  ${entry.purpose}`)
-    lines.push(`  e.g. args: ["${entry.example}"]`)
+    lines.push(`  e.g. args: ${JSON.stringify(entry.example)}`)
     lines.push('')
   }
   lines.push('Arguments are passed to the program directly, without a shell: one array element per shell word,')

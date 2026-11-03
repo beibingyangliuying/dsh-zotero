@@ -67,8 +67,8 @@ import {
   normalizeCollections,
   normalizeTags,
   parseLibrary,
-  readCollection,
   readItem,
+  requireCollection,
   savedSearches,
   serverInfo,
   visibleText,
@@ -1601,6 +1601,7 @@ async function runCollections(options) {
  * @returns {Promise<void>} Prints the listing.
  */
 async function runCollectionItems(options) {
+  await requireCollection(options.value, { library: options.library })
   const base = `${libraryPrefix(options.library)}/collections/${options.value}/items?format=json`
   const shown = []
   let records = 0
@@ -1679,10 +1680,12 @@ async function runCollectionItems(options) {
  * items, the endpoint answered total 0 — so a pass that wants a subtree has to name each collection.
  *
  * @param {string} key A collection key.
- * @returns {Promise<{rows: object[], total: number, complete: boolean}>} Rows in library order, the
- *   library's own total, and whether every one of them was read.
+ * @returns {Promise<{rows: object[], total: number, complete: boolean, collection: object}>} Rows in
+ *   library order, the library's own total, whether every one of them was read, and the collection
+ *   itself - read once here so naming it costs no second request.
  */
 async function collectionRows(key, library = PERSONAL_LIBRARY) {
+  const collection = await requireCollection(key, { library })
   const rows = []
   let total = 0
   for (let start = 0; start < SCREEN_CAP; start += SCREEN_PAGE) {
@@ -1693,7 +1696,7 @@ async function collectionRows(key, library = PERSONAL_LIBRARY) {
     rows.push(...page.rows)
     if (page.rows.length < SCREEN_PAGE || rows.length >= total) break
   }
-  return { rows, total, complete: rows.length >= total }
+  return { rows, total, complete: rows.length >= total, collection }
 }
 
 /**
@@ -1746,10 +1749,8 @@ export function screenRows(rows, { limit = DEFAULT_SCREEN_LIMIT } = {}) {
  * record has readable text needs its children, which is the reading round's errand, not this one's.
  */
 async function runCollectionScreening(options) {
-  const { rows, total, complete } = await collectionRows(options.value, options.library)
-  const name = await readCollection(options.value, { library: options.library })
-    .then((data) => data?.name ?? '')
-    .catch(() => '')
+  const { rows, total, complete, collection } = await collectionRows(options.value, options.library)
+  const name = collection?.name ?? ''
   const { records, skipped, budget, withAbstract } = screenRows(rows, { limit: options.screenLimit })
 
   if (options.json) {

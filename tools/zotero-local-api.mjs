@@ -31,6 +31,7 @@ import { request } from 'node:http'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { Refusal } from './refusal.mjs'
 
 const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_PORT = 23119
@@ -286,7 +287,85 @@ export function libraryUnreachable(error) {
 }
 
 /**
- * One request to the local API.
+ * How many times one READ is attempted, and how long it waits before each retry.
+ *
+ * The local API closes connections under load: measured against Zotero 10.0.6, about half of four
+ * simultaneous reads come back `ECONNRESET`, and even a serialized read loses roughly one in six to
+ * the same reset. {@link serial} removes the first cause; these attempts absorb the second. A WRITE is
+ * never retried: one that may already have been applied must be reported, not repeated.
+ */
+const READ_ATTEMPTS = 6
+const RETRY_DELAYS_MS = [200, 600, 1500, 2500, 4000]
+
+/**
+ * Failures worth repeating for a read: the request either never left, or no answer came back.
+ *
+ * `ECONNREFUSED` is deliberately absent - nothing is listening, and asking again will not change that.
+ */
+const RETRYABLE_CODES = new Set(['ECONNRESET', 'ECONNABORTED', 'EPIPE'])
+
+const noop = () => {}
+
+/** Wait `ms` without a timer object to clean up. */
+const delay = (ms) => new Promise((done) => setTimeout(done, ms))
+
+/** The tail of the queue every request joins, so only one connection is open at a time. */
+let queue = Promise.resolve()
+
+/**
+ * Run `task` after every request already queued.
+ *
+ * The local API resets connections that have another open beside them: parallel reads are the single
+ * largest source of `ECONNRESET` this transport sees, so they are removed here rather than retried
+ * away. A write blocked on the owner's dialog holds the queue, which is what serialization means.
+ *
+ * @template T
+ * @param {() => Promise<T>} task The request to run.
+ * @returns {Promise<T>} What `task` resolved with.
+ */
+function serial(task) {
+  const settled = queue.then(task, task)
+  queue = settled.then(noop, noop)
+  return settled
+}
+
+/**
+ * One request to the local API, after every request already made.
+ *
+ * Reads are retried on a connection-level failure, with a growing pause; writes are not.
+ *
+ * @param {string} method HTTP method.
+ * @param {string} path Path beginning with `/api/`.
+ * @param {{body?: string, headers?: Record<string, string>, timeoutMs?: number}} [options] A body is
+ *   sent verbatim; `timeoutMs` defaults to 0, which is "wait as long as it takes".
+ * @returns {Promise<{status: number, headers: object, text: string}>} The response, unparsed.
+ */
+export function localRequest(method, path, options = {}) {
+  return serial(() => sendWithRetry(method, path, options))
+}
+
+/**
+ * Repeat a read until it answers or the attempts run out.
+ *
+ * @param {string} method HTTP method.
+ * @param {string} path Path beginning with `/api/`.
+ * @param {object} options What {@link sendOnce} takes.
+ * @returns {Promise<{status: number, headers: object, text: string}>} The response, unparsed.
+ */
+async function sendWithRetry(method, path, options) {
+  const attempts = method === 'GET' ? READ_ATTEMPTS : 1
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await sendOnce(method, path, options)
+    } catch (error) {
+      if (attempt >= attempts || !RETRYABLE_CODES.has(error.code)) throw error
+      await delay(RETRY_DELAYS_MS[attempt - 1] ?? RETRY_DELAYS_MS[RETRY_DELAYS_MS.length - 1])
+    }
+  }
+}
+
+/**
+ * Exactly one request, with no attempt to retry it.
  *
  * `timeoutMs` exists for a PROBE and is `0` for everything else. An authorization request BLOCKS until
  * the owner answers a dialog, so giving it a timeout is how a legitimate write gets reported as a
@@ -299,7 +378,7 @@ export function libraryUnreachable(error) {
  *   sent verbatim; `timeoutMs` defaults to 0, which is "wait as long as it takes".
  * @returns {Promise<{status: number, headers: object, text: string}>} The response, unparsed.
  */
-export function localRequest(method, path, { body, headers = {}, timeoutMs = 0 } = {}) {
+function sendOnce(method, path, { body, headers = {}, timeoutMs = 0 } = {}) {
   return new Promise((resolve, reject) => {
     const req = request(
       {
@@ -475,6 +554,31 @@ export function visibleText(html) {
  */
 export async function readCollection(key, { library = PERSONAL_LIBRARY } = {}) {
   return (await getJson(`${libraryPrefix(library)}/collections/${key}`)).data
+}
+
+/**
+ * Refuse a collection key this library does not have.
+ *
+ * The local API answers an unknown collection key with the WHOLE library rather than a 404: measured
+ * 2026-11-03, `/collections/ZZZZZZZZ/items` answered 200 with the library's own total and every item
+ * in it. A listing that skipped this check therefore printed the entire library under a key that names
+ * nothing, and looked like a successful read of a collection.
+ *
+ * @param {string} key The key as it was typed.
+ * @param {{type: string, id: number}} [options] `library` is the library to ask; the personal library
+ *   when absent.
+ * @returns {Promise<object>} The collection, when it exists.
+ * @throws {Refusal} When it does not, naming the list that gives the real keys.
+ */
+export async function requireCollection(key, { library = PERSONAL_LIBRARY } = {}) {
+  try {
+    return await readCollection(key, { library })
+  } catch (error) {
+    if (error?.status !== 404) throw error
+    throw new Refusal(`no collection ${key} in this library.`, {
+      fix: 'Run --collections for the keys it does have.',
+    })
+  }
 }
 
 /**
