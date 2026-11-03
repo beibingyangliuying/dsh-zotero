@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Self-test for the one tool this package publishes, offline.
+// Self-test for the one tool this package publishes. The registration and catalog checks are
+// offline; the one end-to-end run needs a live library and a network, and SKIPs when either is gone.
 //
 // What is load-bearing here: the tool must be REGISTERED with the shape the registry validates, the
 // catalog must name the programs that actually exist (a stale list is how an agent runs a program that
@@ -10,6 +11,7 @@ import { readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { apply, catalogText, clip, formatRun, programNames } from '../../plugin.js'
+import { libraryAnswers, libraryOrigin } from './live.mjs'
 
 const ROOT = fileURLToPath(new URL('../..', import.meta.url))
 
@@ -69,10 +71,20 @@ check(listed.text === catalogText(), 'a call with no program returns the catalog
 
 // --- one real program, end to end ------------------------------------------------------------------
 
-// `--selftest` is the one mode a streaming program offers that writes nothing and needs no library.
-const result = await tool.execute({ program: 'zotero-write', args: ['--selftest'] }, {})
-check(result.text.startsWith('exit 0'), 'a real program runs and reports its exit code', result.text.split('\n')[0])
-check(!result.text.includes('--- stderr ---') || result.text.includes('stderr'), 'stderr only appears when the program wrote to it')
+// `--selftest` is the one mode a streaming program offers that writes nothing. It still resolves the
+// item-type schema through the LOCAL library and the metadata through arXiv/Crossref, so this run
+// needs both; when either is unreachable it SKIPs, and the suite counts the skip as green.
+if (!(await libraryAnswers())) {
+  console.log(`  SKIP a real program runs end to end - no library answers on ${libraryOrigin()}`)
+} else {
+  const result = await tool.execute({ program: 'zotero-write', args: ['--selftest'] }, {})
+  if (/ENOTFOUND|EAI_AGAIN|ETIMEDOUT|getaddrinfo/.test(result.text)) {
+    console.log('  SKIP a real program runs end to end - the metadata network does not answer')
+  } else {
+    check(result.text.startsWith('exit 0'), 'a real program runs and reports its exit code', result.text.split('\n')[0])
+    check(!result.text.includes('--- stderr ---') || result.text.includes('stderr'), 'stderr only appears when the program wrote to it')
+  }
+}
 
 // --- the two text transforms -----------------------------------------------------------------------
 

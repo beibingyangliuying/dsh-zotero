@@ -70,8 +70,10 @@ npm test          # 跑 tools/ 下全部 *-selftest.mjs
 npm run test:list # 只看会跑哪些
 ```
 
-测试是离线的：不需要 Zotero 实例、网络或 DSH 在跑。需要外部 I/O 的部分把 I/O 作为参数注入或
-拒绝运行。`pdfjs-dist` 与 `@hyzyla/pdfium` 是惰性依赖，只有 `zotero-pdf.mjs` 的渲染路径会用到。
+多数测试是离线的：不需要 Zotero 实例、网络或 DSH 在跑。需要外部 I/O 的部分把 I/O 作为参数注入，
+或通过 `ZOTERO_LOCAL_API` 指向测试自己起的 stub。少数端到端测试要一个正在运行的 Zotero（以及
+arXiv/Crossref 的网络）：连不上时它们打印 `SKIP` 并计为通过，所以 Zotero 没开的机器上 `npm test`
+也是绿的。`pdfjs-dist` 与 `@hyzyla/pdfium` 是惰性依赖，只有 `zotero-pdf.mjs` 的渲染路径会用到。
 
 ## 许可证
 

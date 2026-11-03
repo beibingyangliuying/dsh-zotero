@@ -5,9 +5,11 @@
 // lands. A hand-written list has one failure mode and this repository has seen it — a test is added
 // and the list is not, so the new guard runs in nobody's round.
 //
-// Offline is the point: every test here must pass without a Zotero instance, a network, or DSH
-// running. Tests that would need one take their I/O as an argument or refuse to run, which is why
-// the suite is safe in CI and on a laptop with the library closed.
+// Mostly offline: a test here takes its I/O as an argument or stands a stub library up through
+// `ZOTERO_LOCAL_API`, so the suite runs with the library closed. The exceptions are the end-to-end
+// checks that need a running Zotero (and, for the metadata resolvers, a network): those print a
+// `SKIP` line when the thing they need is absent, and this runner counts a skip as green - a closed
+// library is a normal state, not a failing checkout.
 //
 // Usage:
 //   node tools/dev/run-selftests.mjs                # everything
@@ -57,14 +59,20 @@ if (only !== undefined && tests.length === 0) {
 const results = []
 for (const path of tests) {
   console.log(`\n=== ${path} ===`)
-  const run = spawnSync(process.execPath, [path], { cwd: ROOT, stdio: 'inherit' })
-  results.push({ path, passed: run.status === 0, detail: run.status === 0 ? '' : `exit ${run.status}` })
+  const run = spawnSync(process.execPath, [path], { cwd: ROOT, encoding: 'utf8' })
+  if (run.stdout) process.stdout.write(run.stdout)
+  if (run.stderr) process.stderr.write(run.stderr)
+  const passed = run.status === 0
+  const skipped = passed && /^\s*SKIP\b/m.test(run.stdout ?? '')
+  results.push({ path, passed, skipped, detail: passed ? '' : `exit ${run.status}` })
 }
 
 console.log('\n--- suite ---')
-for (const { path, passed, detail } of results) {
-  console.log(`  ${(passed ? 'PASS' : 'FAIL').padEnd(10)} ${path}${detail ? `  (${detail})` : ''}`)
+for (const { path, passed, skipped, detail } of results) {
+  const label = skipped ? 'SKIP' : passed ? 'PASS' : 'FAIL'
+  console.log(`  ${label.padEnd(10)} ${path}${detail ? `  (${detail})` : ''}`)
 }
 const failed = results.filter((result) => !result.passed).length
-console.log(`\n${results.length} self-test(s): ${results.length - failed} passed, ${failed} failed`)
+const skipped = results.filter((result) => result.skipped).length
+console.log(`\n${results.length} self-test(s): ${results.length - failed - skipped} passed, ${skipped} skipped, ${failed} failed`)
 process.exit(failed > 0 ? 1 : 0)

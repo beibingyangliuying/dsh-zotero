@@ -114,8 +114,25 @@ const CATALOG = [
 /** The largest output one call returns. A program's own --limit is the cheaper cut; this is the backstop. */
 const MAX_OUTPUT = 60_000
 
-/** How long one program may run. Generous: several of them make a network request. */
-const TIMEOUT_MS = 120_000
+/**
+ * How long one program may run.
+ *
+ * A read answers or fails within seconds, so a read that has not answered within a minute is hung and
+ * should say so. The minute is not arbitrary: the longest network timeout a read runs internally is
+ * 45 s (`scholarly-read`), and a tool budget shorter than the program's own would cut off the program's
+ * own error and replace it with a vaguer one. A write is a different matter: it can sit on the
+ * reference manager's authorization dialog, or on `--wait` for the reference manager to start, for as
+ * long as its owner leaves it there. One budget for both meant the tool killed a write the user was
+ * still deciding about, and reported it as exit 1 - which is the exact confusion the program's own
+ * exit 3 exists to prevent.
+ */
+const READ_TIMEOUT_MS = 60_000
+const WRITE_TIMEOUT_MS = 300_000
+
+/** The timeout this call gets: a write is any call that may change the library, or wait on it. */
+function timeoutFor(args) {
+  return args.some((arg) => arg === '--write' || arg === '--wait') ? WRITE_TIMEOUT_MS : READ_TIMEOUT_MS
+}
 
 /**
  * The programs a caller may run, read from disk so a program that lands here is callable the same day.
@@ -177,20 +194,24 @@ export function formatRun(code, stdout, stderr) {
 /** Run one program and resolve with what it printed; never rejects, because a refusal is a result. */
 function runProgram(program, args, signal) {
   const file = join(PACKAGE_ROOT, 'tools', `${program}.mjs`)
+  const timeout = timeoutFor(args)
+  const writes = args.includes('--write')
   return new Promise((resolve) => {
     execFile(
       process.execPath,
       [file, ...args],
-      { cwd: PACKAGE_ROOT, timeout: TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024, windowsHide: true, signal },
+      { cwd: PACKAGE_ROOT, timeout, maxBuffer: 16 * 1024 * 1024, windowsHide: true, signal },
       (error, stdout, stderr) => {
         if (error === null) return resolve({ code: 0, stdout: String(stdout), stderr: String(stderr) })
         const timedOut = error.killed === true
-        const code = typeof error.code === 'number' ? error.code : 1
-        resolve({
-          code,
-          stdout: String(stdout),
-          stderr: timedOut ? `${String(stderr)}\n[the program was stopped after ${TIMEOUT_MS / 1000} s]` : String(stderr),
-        })
+        // A stopped write is not a failed write: it may have landed. Report it the way the programs
+        // report that, exit 3, so the caller does not run the same write twice.
+        const code = timedOut && writes ? 3 : typeof error.code === 'number' ? error.code : 1
+        const note = timedOut
+          ? `\n[the program was stopped after ${timeout / 1000} s]` +
+            (writes ? ' It may have written already: read the record before running the write again.' : '')
+          : ''
+        resolve({ code, stdout: String(stdout), stderr: String(stderr) + note })
       },
     )
   })
