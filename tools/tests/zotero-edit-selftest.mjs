@@ -17,7 +17,7 @@ import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { EDITABLE_FIELDS, REFUSED_FIELDS, changedFields, computeTagChange, invalidFields, parseSetFlags } from '../zotero-edit.mjs'
+import { EDITABLE_FIELDS, REFUSED_FIELDS, changedFields, computeTagChange, flattenTrashGraph, invalidFields, isDeleted, parseItemKeys, parseSetFlags, resolveAction } from '../zotero-edit.mjs'
 
 let failures = 0
 const check = (condition, label, detail = '') => {
@@ -136,7 +136,8 @@ const patchRow = (record, patch, expectedVersion) => {
   return { status: 204 }
 }
 
-const server = createServer((req, res) => {  const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+const server = createServer((req, res) => {
+  const url = new URL(req.url ?? '/', 'http://127.0.0.1')
   const path = url.pathname
   stub.requests.push(`${req.method} ${path}`)
   const send = (status, body) => {
@@ -296,6 +297,49 @@ resetLibrary()
 const unknownField = await runAsync(['--item', 'EDIT0001', '--set', 'publisher=Someone'])
 check(unknownField.status === 2, 'a field outside the whitelist is exit 2', `status ${unknownField.status}`)
 
+// --- keys, actions, and the trash graph ----------------------------------------------------------
+
+console.log('\n[5] keys, actions and the trash graph')
+const action = (overrides) =>
+  resolveAction({ items: [], sets: [], add: [], remove: [], restore: [], note: '', text: null, purgeTags: [], ...overrides })
+
+check(parseItemKeys(['ABCD1234,EFGH5678']).length === 2, 'one comma-separated value names two records')
+check(parseItemKeys(['ABCD1234', 'ABCD1234']).join(',') === 'ABCD1234', 'a repeated key stays one record')
+throws('a malformed key is a usage error', () => parseItemKeys(['abc']), 'not an item key')
+throws('an empty key is a usage error', () => parseItemKeys(['ABCD1234,']), 'not an item key')
+
+check(action({ items: ['ABCD1234'], sets: ['title=x'] }) === 'edit', 'a set is an edit')
+check(action({ restore: ['ABCD1234'] }) === 'restore', '--restore is a restore')
+check(action({ note: 'ABCD1234', text: '<p>x</p>' }) === 'note', '--note with --text is a note update')
+check(action({ purgeTags: ['/stale'] }) === 'purge', '--purge-tag is a purge')
+throws('two actions at once are refused', () => action({ items: ['ABCD1234'], sets: ['title=x'], purgeTags: ['/x'] }), 'ONE action')
+throws('--item without an edit flag is refused', () => action({ items: ['ABCD1234'] }), 'pass one action')
+throws('--note without --text is refused', () => action({ note: 'ABCD1234' }), 'pass --text')
+throws('--text outside --note is refused', () => action({ items: ['ABCD1234'], sets: ['title=x'], text: 'x' }), 'only applies')
+throws('--item outside an edit is refused', () => action({ restore: ['ABCD1234'], items: ['EFGH5678'] }), 'does not apply')
+
+const trashGraph = {
+  key: 'PARENT01',
+  version: 3,
+  itemType: 'book',
+  title: 'A book',
+  deleted: true,
+  children: [
+    { key: 'CHILD001', version: 4, itemType: 'note', title: '', deleted: false, children: [] },
+    { key: 'CHILD002', version: 5, itemType: 'attachment', title: 'PDF', deleted: true, children: [] },
+  ],
+}
+const flat = flattenTrashGraph(trashGraph)
+check(flat.map((node) => node.key).join(',') === 'CHILD001,CHILD002,PARENT01', 'children come before their parent', flat.map((node) => node.key).join(','))
+check(flat[0].children === undefined, 'the flat list drops the child lists')
+check(isDeleted(true) && isDeleted(1) && isDeleted('1'), 'every shape of deleted means trashed')
+check(!isDeleted(0) && !isDeleted(false) && !isDeleted(undefined), 'a live record is not trashed')
+
+resetLibrary()
+const notNote = await runAsync(['--note', 'EDIT0001', '--text', '<p>x</p>'])
+check(notNote.status === 1, 'updating a record that is not a note is refused', `status ${notNote.status}`)
+check(notNote.stderr.includes('not a note'), 'and the refusal says what the record is', first(notNote.stderr))
+
 // --- the item type's own schema ------------------------------------------------------------------
 
 console.log('\n[4] a field the item type does not have is refused before the write')
@@ -303,6 +347,89 @@ const journal = new Set(['title', 'DOI', 'publicationTitle'])
 check(invalidFields({ title: 'x', DOI: '10.1/x' }, journal).length === 0, 'valid fields pass')
 check(invalidFields({ publicationTitle: 'x' }, new Set(['title'])).join(',') === 'publicationTitle', 'one invalid field is named')
 check(invalidFields({ publisher: 'x' }, null).length === 0, 'a build that cannot report its schema does not block the edit')
+
+// --- restoring a trashed graph -------------------------------------------------------------------
+
+console.log('\n[5] a restore wakes children before their parent')
+const trashRows = new Map([
+  ['PARENT01', { key: 'PARENT01', version: 3, itemType: 'journalArticle', title: 'A paper', deleted: 1, parentItem: '' }],
+  ['CHILD001', { key: 'CHILD001', version: 4, itemType: 'note', title: '', deleted: 1, parentItem: 'PARENT01' }],
+  ['CHILD002', { key: 'CHILD002', version: 5, itemType: 'attachment', title: 'PDF', deleted: 0, parentItem: 'PARENT01' }],
+])
+const trashWrites = []
+const trashServer = createServer((req, res) => {
+  const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname
+  const send = (status, body) => {
+    res.writeHead(status, { 'content-type': 'application/json' })
+    res.end(body === undefined ? '' : JSON.stringify(body))
+  }
+  if (path === '/api/') {
+    res.writeHead(200, { 'content-type': 'application/json', 'zotero-server-id': 'stub-server' })
+    res.end('{}')
+    return
+  }
+  if (path === '/api/local/authorize' && req.method === 'POST') {
+    send(200, { key: 'stub-key', remember: false })
+    return
+  }
+  const childrenPath = /^\/api\/users\/0\/items\/([A-Z0-9]+)\/children$/.exec(path)
+  if (childrenPath) {
+    const rows = [...trashRows.values()].filter((row) => row.parentItem === childrenPath[1])
+    send(200, rows.map((row) => ({ key: row.key, data: { ...row } })))
+    return
+  }
+  const itemPath = /^\/api\/users\/0\/items\/([A-Z0-9]+)$/.exec(path)
+  if (itemPath && trashRows.has(itemPath[1])) {
+    const row = trashRows.get(itemPath[1])
+    if (req.method === 'PATCH') {
+      let raw = ''
+      req.on('data', (chunk) => (raw += chunk))
+      req.on('end', () => {
+        const expected = req.headers['if-unmodified-since-version']
+        if (String(expected) !== String(row.version)) {
+          send(412, { error: 'stale' })
+          return
+        }
+        Object.assign(row, JSON.parse(raw))
+        row.version += 1
+        trashWrites.push(`${row.key}@${expected}`)
+        res.writeHead(204)
+        res.end()
+      })
+      return
+    }
+    send(200, { data: { ...row } })
+    return
+  }
+  send(404, { error: 'not found' })
+})
+await new Promise((done) => trashServer.listen(0, '127.0.0.1', done))
+const trashOrigin = `127.0.0.1:${trashServer.address().port}`
+const runTrash = (args) =>
+  new Promise((done) => {
+    const child = spawn(process.execPath, [tool, ...args], {
+      env: { ...process.env, ZOTERO_LOCAL_API: trashOrigin, ZOTERO_LOCAL_KEY_STORE: grantPath },
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (chunk) => (stdout += chunk))
+    child.stderr.on('data', (chunk) => (stderr += chunk))
+    child.on('close', (status) => done({ status, stdout, stderr }))
+  })
+
+const restorePlan = await runTrash(['--restore', 'PARENT01'])
+check(restorePlan.status === 0, 'a dry-run restore exits 0', `status ${restorePlan.status}`)
+check(!restorePlan.stdout.includes('Nothing to restore'), 'a trashed graph is not called already present')
+check(trashWrites.length === 0, 'and no PATCH was sent', `${trashWrites.length} write(s)`)
+
+const restoreRun = await runTrash(['--restore', 'PARENT01', '--write'])
+check(restoreRun.status === 0, 'a restore the library accepts exits 0', `status ${restoreRun.status}`)
+check(trashWrites.join(',') === 'CHILD001@4,PARENT01@3', 'the child is woken before its parent', trashWrites.join(','))
+check([...trashRows.values()].every((row) => !isDeleted(row.deleted)), 'every trashed node is live afterwards')
+
+const restoreAgain = await runTrash(['--restore', 'PARENT01', '--write'])
+check(restoreAgain.status === 0 && restoreAgain.stdout.includes('Nothing to restore'), 'a live graph is already present, not rewritten')
+trashServer.close()
 
 server.close()
 

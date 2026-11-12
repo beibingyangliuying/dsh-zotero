@@ -1,6 +1,6 @@
 {
   "name": "@beibingyangliuying/dsh-zotero",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "External channel helpers for the dsh-autoresearch workbench: local Zotero, arXiv, bibliographic REST, index discovery and journal ranking, shipped as command-line programs behind one discovery tool.",
   "license": "MIT",
   "type": "module",

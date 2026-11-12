@@ -5,7 +5,12 @@
 // The fixtures are the shapes the local API documents: an item listing whose rows include notes and
 // attachments, and a citation batch that may answer in a different order than it was asked.
 import {
+  CSV_COLUMNS,
+  buildCsv,
   buildExportPath,
+  creatorsText,
+  csvCell,
+  itemToCsvRow,
   orderCitations,
   parseArgs,
   selectExportKeys,
@@ -87,6 +92,58 @@ check(ordered[0].key === 'A' && ordered[0].citation === '<i>A</i>', 'the first r
 check(ordered[1].key === 'B', 'and the second follows')
 const missing = orderCitations([{ key: 'A', citation: 'x' }], ['A', 'B'])
 check(missing[1].citation === '', 'a citation the library omitted is empty, not invented')
+
+// --- CSV ------------------------------------------------------------------------------------------
+
+console.log('\n[5] a CSV row is quoted only when it has to be')
+check(csvCell('plain') === 'plain', 'a plain cell is unchanged')
+check(csvCell('a,b') === '"a,b"', 'a comma forces quotes')
+check(csvCell('say "hi"') === '"say ""hi"""', 'an embedded quote doubles')
+check(csvCell('line one\nline two') === '"line one\nline two"', 'a line break forces quotes')
+check(csvCell(' pad ') === '" pad "', 'leading and trailing spaces are preserved by quoting')
+check(csvCell(undefined) === '' && csvCell(null) === '', 'a missing value is an empty cell')
+
+console.log('\n[6] the row carries the fields a spreadsheet is read for')
+check(
+  creatorsText([
+    { firstName: 'Ashish', lastName: 'Vaswani' },
+    { name: 'OpenAI' },
+  ]) === 'Ashish Vaswani; OpenAI',
+  'creators are name-joined, with a single-field creator kept as-is',
+)
+const RECORD = {
+  key: 'AAAABBBB',
+  data: {
+    itemType: 'journalArticle',
+    title: 'Attention, again',
+    creators: [{ firstName: 'Ashish', lastName: 'Vaswani' }],
+    date: '2017',
+    publicationTitle: 'NeurIPS',
+    DOI: '10.1000/x',
+    citationKey: 'vaswani2017',
+    tags: [{ tag: 'transformers' }, { tag: 'nlp' }],
+  },
+}
+check(itemToCsvRow(RECORD).length === CSV_COLUMNS.length, 'a row has one cell per column')
+check(itemToCsvRow(RECORD)[0] === 'AAAABBBB', 'the key is the first cell')
+check(itemToCsvRow(RECORD)[CSV_COLUMNS.indexOf('tags')] === 'transformers; nlp', 'tags are semicolon-joined')
+
+const csv = buildCsv([RECORD])
+const lines = csv.trimEnd().split('\n')
+check(lines[0] === CSV_COLUMNS.join(','), 'the header is the column list')
+check(lines.length === 2, 'one header and one record')
+check(csv.includes('"Attention, again"'), 'a comma in the title is quoted in the document')
+check(csv.endsWith('\n'), 'the document is newline-terminated')
+
+console.log('\n[7] --output is a path, and csv is a format')
+const saved = parseArgs(['--item', 'ABCD2345', '--format', 'csv', '--output', 'refs.csv'])
+check(saved.format === 'csv' && saved.output === 'refs.csv', 'csv and --output parse together')
+const commaList = parseArgs(['--item', 'ABCD2345, EFGH6789', '--format', 'csv'])
+check(
+  JSON.stringify(commaList.items) === JSON.stringify(['ABCD2345', 'EFGH6789']),
+  'one --item may name a comma-separated list',
+)
+throws('--output without a path is refused', () => parseArgs(['--item', 'A', '--format', 'csv', '--output']))
 
 console.log(`\n${failures === 0 ? 'PASS' : `FAIL (${failures})`}`)
 process.exit(failures === 0 ? 0 : 1)

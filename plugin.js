@@ -36,17 +36,17 @@ const PACKAGE_ROOT = fileURLToPath(new URL('./', import.meta.url))
 const CATALOG = [
   {
     program: 'zotero-read',
-    purpose: 'read the library: full-text search, one item or note, BM25 passages, collections, item-type schema, change cursor, DOI lookup',
+    purpose: 'read the library: full-text search, one item or note, batch reads by key, BM25 passages, collections, item-type schema, change cursor, DOI lookup, and reference reconciliation against BibTeX/JSON',
     example: ['--search', 'seismic risk', '--limit', '10'],
   },
   {
     program: 'zotero-write',
-    purpose: 'add one item by DOI or arXiv id, optionally filing it into a collection; a dry run unless --write is given',
+    purpose: 'add one item by DOI, arXiv id, or item type + fields, or add a note; optionally filing it into a collection; a dry run unless --write is given',
     example: ['--doi', '10.1000/xyz', '--write'],
   },
   {
     program: 'zotero-edit',
-    purpose: "change an item's fields or tags; a dry run unless --write is given",
+    purpose: "change fields or tags on one or more items; restore trashed items, rewrite a note, or delete library tags; a dry run unless --write is given",
     example: ['--item', 'ABCD1234', '--set', 'title=A new title', '--write'],
   },
   {
@@ -56,12 +56,12 @@ const CATALOG = [
   },
   {
     program: 'zotero-collection',
-    purpose: 'list, show, create, rename or assign collections; every write is a dry run unless --write is given',
+    purpose: 'list, show, create, rename, delete or assign collections, and manage saved searches; every write is a dry run unless --write is given',
     example: ['--show', 'ABCD1234'],
   },
   {
     program: 'zotero-export',
-    purpose: 'formatted citations, bibliographies and BibTeX/RIS/CSL-JSON exports, through the library own translators',
+    purpose: 'formatted citations, bibliographies and BibTeX/RIS/CSL-JSON/CSV exports, through the library own translators; --output writes to a file',
     example: ['--item', 'ABCD1234', '--format', 'bibtex'],
   },
   {

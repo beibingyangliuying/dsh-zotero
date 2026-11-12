@@ -384,7 +384,7 @@ check(creates().length === 1, 'and that is the one create it sends', `${creates(
 // A bad key costs no request at all: the argument is refused before the gate is opened.
 resetLibrary()
 const badKey = await runAsync(['--arxiv', '1706.03762', '--collection', 'nope'])
-check(badKey.status === 1, 'a malformed collection key is refused', `status ${badKey.status}`)
+check(badKey.status === 2, 'a malformed collection key is a usage error', `status ${badKey.status}`)
 check(badKey.stderr.includes('eight-character key'), 'and it says what a key looks like', first(badKey.stderr))
 check(stub.requests.length === 0, 'and not one request was sent', `${stub.requests.length} request(s)`)
 

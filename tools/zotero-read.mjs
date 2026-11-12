@@ -45,9 +45,12 @@
 //   node tools/zotero-read.mjs --collection <collectionKey>
 //   node tools/zotero-read.mjs --collection <collectionKey> --screen [--screen-limit 300]
 //   node tools/zotero-read.mjs --tags
+//   node tools/zotero-read.mjs --items KEY1,KEY2,KEY3
+//   node tools/zotero-read.mjs --match refs.bib --format bibtex
+//   node tools/zotero-read.mjs --match - --format json < refs.json
 //
 // Exit codes: 0 answered | 1 the library could not answer, or the record has no such text | 2 usage.
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
@@ -100,6 +103,10 @@ const SCREEN_PAGE = 100
 const DEFAULT_SCREEN_LIMIT = 300
 /** A ceiling on how many rows a screening pass will read, so a runaway collection stops loudly. */
 const SCREEN_CAP = 2_000
+/** Keys one `--items` call may read, matching the library's multi-get chunk. */
+const BATCH_LIMIT = 50
+/** Reference-file formats `--match` understands. */
+const REFERENCE_FORMATS = ['bibtex', 'json']
 
 /**
  * How many rows a plain `--collection` listing reads before it stops and says so.
@@ -415,6 +422,9 @@ const USAGE =
   '       node tools/zotero-read.mjs --changes [--since N]   # baseline, or what changed after a version\n' +
   '       node tools/zotero-read.mjs --item-types | --item-fields <type> | --saved-searches\n' +
   '       node tools/zotero-read.mjs --find-doi <doi>   # is that work already in this library?\n' +
+  '       node tools/zotero-read.mjs --items <key,key,...>   # up to 50 records in one pass\n' +
+  '       node tools/zotero-read.mjs --match <file|-> [--format bibtex|json]\n' +
+  '                                  # which references are already here, and where they differ\n' +
   '       node tools/zotero-read.mjs --collection <key> --screen [--screen-limit N]\n' +
   '       [--library user:0|group:<id>] [--json]\n' +
   '       --limit counts ROWS for a search (at most 100, the library\'s page size) and CHARACTERS for a\n' +
@@ -463,6 +473,8 @@ export function parseArgs(argv) {
     sources: [...RETRIEVAL_SOURCES],
     since: null,
     sinceRaw: '',
+    keys: [],
+    format: '',
   }
   const integer = (name, raw, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) => {
     const parsed = Number(raw)
@@ -483,10 +495,16 @@ export function parseArgs(argv) {
       case '--collection':
       case '--find-doi':
       case '--item-fields':
+      case '--items':
+      case '--match':
         if (options.mode) throw new UsageError('pass one mode, not two')
         if (!next) throw new UsageError(`${flag} needs a value`)
         options.mode = flag.slice(2)
         options.value = next
+        index += 1
+        break
+      case '--format':
+        options.format = next ?? ''
         index += 1
         break
       case '--collections':
@@ -586,7 +604,7 @@ export function parseArgs(argv) {
         throw new UsageError(`unrecognised argument '${flag}'`)
     }
   }
-  if (!options.mode) throw new UsageError('pass one mode (--search, --item, --fulltext, --retrieve, --locate, --collections, --collection, --tags, --changes, --item-types, --item-fields, --saved-searches, --find-doi)')
+  if (!options.mode) throw new UsageError('pass one mode (--search, --item, --items, --fulltext, --retrieve, --locate, --collections, --collection, --tags, --changes, --item-types, --item-fields, --saved-searches, --find-doi, --match)')
   try {
     options.library = parseLibrary(options.libraryRaw)
   } catch (error) {
@@ -646,7 +664,51 @@ export function parseArgs(argv) {
   if (options.limitRaw !== undefined) {
     options.limit = integer('limit', options.limitRaw, { min: 1, max: reading ? MAX_READ_LIMIT : MAX_LIMIT })
   }
+  if (options.format !== '' && options.mode !== 'match') {
+    throw new UsageError('--format says how to read a --match file; it applies to --match only')
+  }
+  if (options.mode === 'items') {
+    if (options.limitRaw !== undefined) {
+      throw new UsageError('--items reads exactly the keys it is given; --limit does not apply')
+    }
+    if (options.offset !== 0 || options.grep !== '' || options.headings) {
+      throw new UsageError('--items returns each record whole; --offset, --grep and --headings apply to one --item read')
+    }
+    options.keys = parseItemKeys(options.value)
+  }
+  if (options.mode === 'match') {
+    if (options.format === '') options.format = /\.json$/i.test(options.value) ? 'json' : 'bibtex'
+    if (!REFERENCE_FORMATS.includes(options.format)) {
+      throw new UsageError(`--format takes ${REFERENCE_FORMATS.join(' or ')}, got '${options.format}'`)
+    }
+  }
   return options
+}
+
+/**
+ * The item keys one `--items` call reads, deduplicated and validated.
+ *
+ * Keys are refused before a request is made: a typo would otherwise come back as one 404 among fifty
+ * records, which reads like a missing paper rather than a bad argument.
+ *
+ * @param {string} raw The flag value, comma-separated.
+ * @returns {string[]} Distinct keys in first-seen order.
+ * @throws {UsageError} On an empty list, more than {@link BATCH_LIMIT} keys, or a key of the wrong shape.
+ */
+export function parseItemKeys(raw) {
+  const keys = String(raw ?? '')
+    .split(',')
+    .map((key) => key.trim())
+    .filter(Boolean)
+  if (keys.length === 0) throw new UsageError('--items needs at least one item key')
+  if (keys.length > BATCH_LIMIT) {
+    throw new UsageError(`--items reads at most ${BATCH_LIMIT} keys at a time, got ${keys.length}`)
+  }
+  const malformed = keys.filter((key) => !/^[A-Z0-9]{8}$/.test(key))
+  if (malformed.length > 0) {
+    throw new UsageError(`not an item key: ${malformed.join(', ')} (a key is eight uppercase letters or digits)`)
+  }
+  return [...new Set(keys)]
 }
 
 /**
@@ -1094,6 +1156,479 @@ async function runItem(options) {
     console.log('---')
     console.log(slice.text)
   }
+}
+
+/**
+ * A title as matching compares it: markup, braces, accents, case and punctuation removed.
+ *
+ * Two catalogues spell the same paper differently ("Attention Is All You Need" vs "Attention is all
+ * you need."), so exact string equality would call a held paper missing. Everything that survives is
+ * a letter or a digit, which also keeps a Chinese title one comparable string.
+ *
+ * @param {string} value Any title.
+ * @returns {string} The comparison form, `''` for no title.
+ */
+export function normalizeTitle(value) {
+  return String(value ?? '')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/[{}]/g, '')
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim()
+}
+
+/** The index of the delimiter that closes `openIndex`, or `-1`. Escaped characters are skipped. */
+function matchingDelimiter(text, openIndex, openChar, closeChar) {
+  let depth = 0
+  for (let index = openIndex; index < text.length; index += 1) {
+    const char = text[index]
+    if (char === '\\') {
+      index += 1
+      continue
+    }
+    if (char === openChar) depth += 1
+    else if (char === closeChar) {
+      depth -= 1
+      if (depth === 0) return index
+    }
+  }
+  return -1
+}
+
+/** Split on top-level commas: a comma inside `{...}` or `"..."` is part of a value, not a separator. */
+function splitTopLevel(body) {
+  const parts = []
+  let depth = 0
+  let quoted = false
+  let start = 0
+  for (let index = 0; index < body.length; index += 1) {
+    const char = body[index]
+    if (char === '\\') {
+      index += 1
+      continue
+    }
+    if (quoted) {
+      if (char === '"') quoted = false
+      continue
+    }
+    if (char === '"') quoted = true
+    else if (char === '{') depth += 1
+    else if (char === '}') depth -= 1
+    else if (char === ',' && depth === 0) {
+      parts.push(body.slice(start, index))
+      start = index + 1
+    }
+  }
+  parts.push(body.slice(start))
+  return parts
+}
+
+/** Strip one layer of BibTeX value syntax: `{...}`, `"..."`, or bare text; inner braces are kept. */
+function unbraceBibtexValue(value) {
+  let text = String(value ?? '').trim()
+  for (;;) {
+    if (text.startsWith('{') && matchingDelimiter(text, 0, '{', '}') === text.length - 1) {
+      text = text.slice(1, -1).trim()
+      continue
+    }
+    if (text.startsWith('"') && text.endsWith('"') && text.length >= 2) {
+      text = text.slice(1, -1).trim()
+      continue
+    }
+    break
+  }
+  return text.replace(/[{}]/g, '').replace(/\s+/g, ' ').trim()
+}
+
+/**
+ * The entries of a BibTeX file, parsed without a dependency.
+ *
+ * Only what a reference match needs is read: the citation key, the entry type, and every field as
+ * brace-stripped text. `@comment`, `@preamble` and `@string` are skipped rather than reported as
+ * malformed entries, because a `.bib` file may legitimately start with them.
+ *
+ * @param {string} text The file's contents.
+ * @returns {{entries: Array<{id: string, type: string, fields: Record<string, string>}>, problems: string[]}}
+ *   The entries in file order, and what could not be parsed.
+ */
+export function parseBibtex(text) {
+  const source = String(text ?? '')
+  const entries = []
+  const problems = []
+  let cursor = 0
+  while (cursor < source.length) {
+    const at = source.indexOf('@', cursor)
+    if (at === -1) break
+    const head = /^@([A-Za-z]+)\s*([{(])/.exec(source.slice(at))
+    if (head === null) {
+      cursor = at + 1
+      continue
+    }
+    const type = head[1].toLowerCase()
+    const openChar = head[2]
+    const closeChar = openChar === '{' ? '}' : ')'
+    const openIndex = at + head[0].length - 1
+    const end = matchingDelimiter(source, openIndex, openChar, closeChar)
+    if (end === -1) {
+      problems.push(`unterminated @${type} starting at offset ${at}`)
+      break
+    }
+    const body = source.slice(openIndex + 1, end)
+    cursor = end + 1
+    if (type === 'comment' || type === 'preamble' || type === 'string') continue
+    const parts = splitTopLevel(body)
+    const id = (parts.shift() ?? '').trim()
+    const fields = {}
+    for (const part of parts) {
+      const equals = part.indexOf('=')
+      if (equals === -1) continue
+      const name = part.slice(0, equals).trim().toLowerCase()
+      if (name === '') continue
+      fields[name] = unbraceBibtexValue(part.slice(equals + 1))
+    }
+    entries.push({ id, type, fields })
+  }
+  return { entries, problems }
+}
+
+/** Author surnames as BibTeX writes them: `Last, First` before the comma, `First Last` after the words. */
+function bibtexAuthors(field) {
+  return String(field ?? '')
+    .split(/\s+and\s+/i)
+    .map((name) => name.trim())
+    .filter((name) => name !== '' && name.toLowerCase() !== 'others')
+    .map((name) => {
+      const comma = name.indexOf(',')
+      if (comma !== -1) return name.slice(0, comma).trim()
+      const words = name.split(/\s+/)
+      return words[words.length - 1]
+    })
+}
+
+/** One reference in the shape `--match` compares, from a BibTeX entry. */
+export function referenceFromEntry(entry) {
+  const fields = entry.fields ?? {}
+  const year = String(fields.year ?? fields.date ?? '').match(/\d{4}/)?.[0] ?? ''
+  return {
+    id: entry.id || fields.doi || fields.title || '(no key)',
+    doi: sameDoi(fields.doi ?? ''),
+    title: fields.title ?? '',
+    year,
+    authors: bibtexAuthors(fields.author ?? fields.editor ?? ''),
+  }
+}
+
+/**
+ * References from a JSON file: an array, `{references: [...]}`, or one object.
+ *
+ * The accepted field names are the ones reference managers and citation exports actually use, so a
+ * caller does not have to reshape a Zotero or CSL export first. Unknown keys are ignored.
+ *
+ * @param {string} text The file's contents.
+ * @returns {{references: object[], problems: string[]}} The usable references, and rows that carried no
+ *   title and no DOI.
+ * @throws {SyntaxError} When the file is not JSON.
+ */
+export function parseReferenceJson(text) {
+  const parsed = JSON.parse(text)
+  const rows = Array.isArray(parsed)
+    ? parsed
+    : Array.isArray(parsed?.references)
+      ? parsed.references
+      : [parsed]
+  const references = []
+  const problems = []
+  for (const [index, row] of rows.entries()) {
+    const title = String(row?.title ?? row?.Title ?? '').trim()
+    const doi = sameDoi(row?.doi ?? row?.DOI ?? '')
+    if (title === '' && doi === '') {
+      problems.push(`row ${index + 1} has neither a title nor a DOI`)
+      continue
+    }
+    const rawAuthors = row?.authors ?? row?.author ?? row?.creators ?? []
+    const authors = (Array.isArray(rawAuthors) ? rawAuthors : [rawAuthors])
+      .map((author) => {
+        if (typeof author === 'string') return author.split(',')[0].trim()
+        return String(author?.family ?? author?.lastName ?? author?.name ?? '').trim()
+      })
+      .filter(Boolean)
+    const year = String(row?.year ?? row?.date ?? row?.issued ?? '').match(/\d{4}/)?.[0] ?? ''
+    references.push({
+      id: String(row?.id ?? row?.citekey ?? row?.citationKey ?? row?.key ?? doi ?? title),
+      doi,
+      title,
+      year,
+      authors,
+    })
+  }
+  return { references, problems }
+}
+
+/** The citation-relevant difference between a reference and the record the library holds. */
+export function referenceDiff(reference, data = {}) {
+  const diffs = []
+  if (reference.doi && sameDoi(data.DOI) !== sameDoi(reference.doi)) {
+    diffs.push({ field: 'DOI', reference: reference.doi, library: data.DOI ?? '' })
+  }
+  if (reference.title && normalizeTitle(reference.title) !== normalizeTitle(data.title)) {
+    diffs.push({ field: 'title', reference: reference.title, library: data.title ?? '' })
+  }
+  if (reference.year && reference.year !== (yearOf(data.date) || '')) {
+    diffs.push({ field: 'year', reference: reference.year, library: yearOf(data.date) || '' })
+  }
+  if (reference.authors.length > 0) {
+    const held = (data.creators ?? [])
+      .filter((creator) => creator?.creatorType === 'author')
+      .map((creator) => String(creator?.lastName ?? creator?.name ?? '').trim())
+      .filter(Boolean)
+    const sameFirst = (held[0] ?? '').toLowerCase() === reference.authors[0].toLowerCase()
+    if (!sameFirst || held.length !== reference.authors.length) {
+      diffs.push({ field: 'authors', reference: reference.authors.join('; '), library: held.join('; ') })
+    }
+  }
+  return diffs
+}
+
+/** Exact normalized-title matches; when there are none, a long title that is a prefix of the other. */
+export function titleMatches(reference, candidates) {
+  const wanted = normalizeTitle(reference.title)
+  if (wanted === '') return []
+  const exact = candidates.filter((candidate) => normalizeTitle(candidate.data?.title) === wanted)
+  if (exact.length > 0) return exact
+  return candidates.filter((candidate) => {
+    const held = normalizeTitle(candidate.data?.title)
+    if (held === '') return false
+    const shorter = held.length <= wanted.length ? held : wanted
+    const longer = shorter === held ? wanted : held
+    return shorter.length >= 20 && longer.startsWith(shorter)
+  })
+}
+
+/** Candidate records ordered by shared title tokens, for naming what a missing reference resembles. */
+export function nearestCandidates(reference, candidates, { limit = 3 } = {}) {
+  const tokens = new Set(normalizeTitle(reference.title).split(' ').filter(Boolean))
+  return candidates
+    .map((candidate) => {
+      const held = new Set(normalizeTitle(candidate.data?.title).split(' ').filter(Boolean))
+      let shared = 0
+      for (const token of tokens) if (held.has(token)) shared += 1
+      return { ...candidate, shared }
+    })
+    .filter((candidate) => candidate.shared > 0)
+    .sort((a, b) => b.shared - a.shared)
+    .slice(0, limit)
+}
+
+/** The rows a reference is looked up by: its DOI first, then its title in the cheap search mode. */
+async function referenceCandidates(reference, options) {
+  const found = new Map()
+  const collect = (rows) => {
+    for (const row of rows) {
+      const type = row.data?.itemType
+      if (type === 'note' || type === 'attachment') continue
+      if (!found.has(row.key)) found.set(row.key, { key: row.key, data: row.data ?? {} })
+    }
+  }
+  if (reference.doi !== '') {
+    const params = new URLSearchParams({ q: reference.doi, qmode: 'everything', format: 'json', limit: '10' })
+    const { rows } = await paginatedJson(`${libraryPrefix(options.library)}/items?${params}`)
+    collect(rows)
+  }
+  if (reference.title !== '') {
+    const params = new URLSearchParams({
+      q: reference.title,
+      qmode: 'titleCreatorYear',
+      format: 'json',
+      limit: String(options.limit),
+    })
+    const { rows } = await paginatedJson(`${libraryPrefix(options.library)}/items?${params}`)
+    collect(rows)
+  }
+  return [...found.values()]
+}
+
+function loadReferences(options) {
+  const source = options.value
+  let text
+  try {
+    text = source === '-' ? readFileSync(0, 'utf8') : readFileSync(source, 'utf8')
+  } catch (error) {
+    throw new Refusal(`cannot read the reference file '${source}': ${error.message}`, {
+      fix: 'pass a readable path, or - to read the references from standard input',
+    })
+  }
+  return options.format === 'json' ? parseReferenceJson(text) : parseBibtex(text)
+}
+
+/**
+ * Every reference of one file, answered against the library: held, ambiguous, or missing.
+ *
+ * A DOI that the library holds is a match even when the record's title is spelled differently; a
+ * title match is only claimed on normalized equality (or a long prefix), and two equal candidates are
+ * reported as ambiguous rather than one of them being picked.
+ */
+async function runMatch(options) {
+  const loaded = loadReferences(options)
+  const references =
+    options.format === 'json'
+      ? loaded.references
+      : loaded.entries.map((entry) => referenceFromEntry(entry))
+  if (references.length === 0) {
+    throw new Refusal(`no references found in '${options.value}'`, {
+      fix: `the file parsed as ${options.format} but held no entry; check that it is a ${options.format} file`,
+    })
+  }
+  const matched = []
+  const ambiguous = []
+  const missing = []
+  for (const reference of references) {
+    const candidates = await referenceCandidates(reference, options)
+    const byDoi = reference.doi === '' ? [] : candidates.filter((candidate) => sameDoi(candidate.data.DOI) === reference.doi)
+    const hits = byDoi.length > 0 ? byDoi : titleMatches(reference, candidates)
+    if (hits.length === 1) {
+      matched.push({
+        reference,
+        key: hits[0].key,
+        ref: itemRef(hits[0].key, options.library),
+        diffs: referenceDiff(reference, hits[0].data),
+      })
+    } else if (hits.length > 1) {
+      ambiguous.push({
+        reference,
+        candidates: hits.map(({ key, data }) => ({
+          key,
+          ref: itemRef(key, options.library),
+          title: data.title ?? '',
+          year: yearOf(data.date) || '',
+          doi: data.DOI ?? '',
+        })),
+      })
+    } else {
+      missing.push({
+        reference,
+        nearest: nearestCandidates(reference, candidates).map(({ key, data }) => ({
+          key,
+          title: data.title ?? '',
+          year: yearOf(data.date) || '',
+          doi: data.DOI ?? '',
+        })),
+      })
+    }
+  }
+
+  if (options.json) {
+    console.log(
+      JSON.stringify(
+        {
+          source: options.value === '-' ? '(stdin)' : options.value,
+          format: options.format,
+          total: references.length,
+          matched,
+          ambiguous,
+          missing,
+          problems: loaded.problems,
+        },
+        null,
+        2,
+      ),
+    )
+    return
+  }
+
+  console.log(`source  : ${options.value === '-' ? '(stdin)' : options.value}  · ${options.format}`)
+  console.log(
+    `result  : ${references.length} reference(s) · ${matched.length} matched · ${ambiguous.length} ambiguous · ${missing.length} missing`,
+  )
+  for (const problem of loaded.problems) console.log(`problem : ${problem}`)
+  const withDiffs = matched.filter((entry) => entry.diffs.length > 0)
+  matched.forEach((entry, index) => {
+    const title = entry.reference.title || '(no title)'
+    console.log(`${index + 1}. MATCHED  ${entry.key}  ${title}`)
+    for (const diff of entry.diffs) {
+      console.log(`   diff  : ${diff.field}: reference "${diff.reference}" vs library "${diff.library}"`)
+    }
+  })
+  for (const entry of ambiguous) {
+    console.log(`? AMBIGUOUS  ${entry.reference.id}  ${entry.reference.title || '(no title)'} · ${entry.candidates.length} candidates`)
+    for (const candidate of entry.candidates) {
+      console.log(`   - ${candidate.key}  ${candidate.year || '????'}  ${candidate.title}`)
+    }
+  }
+  for (const entry of missing) {
+    console.log(`- MISSING    ${entry.reference.id}  ${entry.reference.title || '(no title)'}`)
+    if (entry.reference.doi) console.log(`   doi   : ${entry.reference.doi}`)
+    for (const candidate of entry.nearest) {
+      console.log(`   near  : ${candidate.key}  ${candidate.year || '????'}  ${candidate.title}`)
+    }
+  }
+  console.log(
+    `summary : ${matched.length} held${withDiffs.length > 0 ? ` (${withDiffs.length} with field differences)` : ''}, ` +
+      `${ambiguous.length} ambiguous, ${missing.length} missing - the library answered every lookup.`,
+  )
+}
+
+/**
+ * Several records by key in one pass, one request per fifty keys.
+ *
+ * A key that answers 404 is reported among the results rather than aborting the batch: the caller
+ * asked for many keys, and one stale one must not hide the other forty-nine.
+ */
+async function runItems(options) {
+  const results = []
+  for (const key of options.keys) {
+    try {
+      results.push({ key, ok: true, data: await readItem(key, { library: options.library }) })
+    } catch (error) {
+      if (error.status === undefined) throw error
+      results.push({ key, ok: false, status: error.status, error: error.message })
+    }
+  }
+  const read = results.filter((entry) => entry.ok)
+  const failed = results.filter((entry) => !entry.ok)
+  if (options.json) {
+    console.log(
+      JSON.stringify(
+        {
+          library: options.library,
+          requested: options.keys.length,
+          read: read.length,
+          items: results.map((entry) =>
+            entry.ok
+              ? {
+                  key: entry.key,
+                  ok: true,
+                  ref: itemRef(entry.key, options.library),
+                  citation: citationFields(entry.data),
+                  data: entry.data,
+                }
+              : { key: entry.key, ok: false, status: entry.status, error: entry.error },
+          ),
+        },
+        null,
+        2,
+      ),
+    )
+    return
+  }
+  console.log(`items   : ${options.keys.length} key(s) asked · ${read.length} read · ${failed.length} missing`)
+  results.forEach((entry, index) => {
+    if (!entry.ok) {
+      console.log(`${index + 1}. ${entry.key}  MISSING (${entry.status})  ${entry.error}`)
+      return
+    }
+    const data = entry.data
+    console.log(`${index + 1}. ${entry.key}  ${yearOf(data.date) || '????'}  [${data.itemType ?? 'unknown'}]  ${data.title || '(no title)'}`)
+    const authors = shortCreators(data.creators)
+    if (authors) console.log(`   by   : ${authors}`)
+    const citation = citationFields(data)
+    const venue = citation.venue ?? citation.publisher ?? ''
+    if (venue) console.log(`   venue: ${venue}`)
+    if (data.DOI) console.log(`   DOI  : ${data.DOI}`)
+    const tags = normalizeTags(data.tags)
+    if (tags.length > 0) console.log(`   tags : ${tags.join(' · ')}`)
+  })
 }
 
 async function runFulltext(options) {
@@ -1841,6 +2376,8 @@ async function main() {
     'item-fields': runItemFields,
     'saved-searches': runSavedSearches,
     'find-doi': runFindDoi,
+    items: runItems,
+    match: runMatch,
   }
   await modes[options.mode](options)
 }

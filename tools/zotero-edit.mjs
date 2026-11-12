@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Edit ONE record's own fields and tags in the reference library: one record, one write.
+// Edit a record's own fields and tags in the reference library, and keep the library's trash in order:
+// one plan, one write per record.
 //
 // WHY THIS FILE EXISTS
 //
@@ -21,17 +22,37 @@
 //   node tools/zotero-edit.mjs --item <itemKey> --set DOI=10.xxxx/yyyy --write
 //   node tools/zotero-edit.mjs --item <itemKey> --set DOI=                        # clear a field
 //   node tools/zotero-edit.mjs --item <itemKey> --add-tag /done --remove-tag /unread --write
+//   node tools/zotero-edit.mjs --item <k1,k2> --add-tag /reviewed --write   # one patch, every record
+//   node tools/zotero-edit.mjs --note <noteKey> --text '<p>new body</p>' --write
+//   node tools/zotero-edit.mjs --restore <itemKey> --write                  # whole Trash subtree
+//   node tools/zotero-edit.mjs --purge-tag /stale --write                   # library-wide tag delete
 //
 // Exit codes: 0 applied and read back, or nothing to do | 1 refused, nothing written | 2 usage |
 // 3 sent or written but unconfirmed - the record may already carry the change, so read it, do not
 // resend it.
-import { APP_NAME, createWriteGate, fieldNamesForType, mayHaveLanded, normalizeTags, patchItem, readItem, reportUnconfirmed } from './zotero-local-api.mjs'
+import {
+  APP_NAME,
+  childrenOf,
+  createWriteGate,
+  fieldNamesForType,
+  getJson,
+  isWriteAccepted,
+  libraryVersion,
+  mayHaveLanded,
+  normalizeTags,
+  patchItem,
+  readItem,
+  reportUnconfirmed,
+} from './zotero-local-api.mjs'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Refusal, UsageError, reportFailure, reportHelp, wantsHelp } from './refusal.mjs'
 
 /** The reader, named in a `fix` line only as an absolute, runnable path. */
 const READ_TOOL = fileURLToPath(new URL('./zotero-read.mjs', import.meta.url))
+
+/** An item key as the library writes it. */
+const KEY_SHAPE = /^[A-Z0-9]{8}$/
 
 /** Set immediately before the PATCH is sent, so a failure after that point is never called a refusal. */
 let writeAttempted = false
@@ -104,6 +125,27 @@ export function parseSetFlags(assignments) {
 }
 
 /**
+ * Read `--item`/`--restore` values into one ordered key list.
+ *
+ * @param {string[]} raws Raw flag values, each comma-separated; repeated flags are allowed.
+ * @returns {string[]} Distinct keys in first-seen order.
+ * @throws {UsageError} For a value that is not an 8-character item key.
+ */
+export function parseItemKeys(raws) {
+  const keys = []
+  for (const raw of raws) {
+    for (const part of String(raw ?? '').split(',')) {
+      const key = part.trim()
+      if (!KEY_SHAPE.test(key)) {
+        throw new UsageError(`not an item key: '${key}' (eight uppercase letters or digits)`)
+      }
+      if (!keys.includes(key)) keys.push(key)
+    }
+  }
+  return keys
+}
+
+/**
  * The tag list a change produces.
  *
  * The whole list is computed and sent rather than a delta, because whether a patch's `tags` REPLACES
@@ -161,34 +203,128 @@ export function changedFields(before, patch) {
     .map(([field, value]) => ({ field, from: String(before[field] ?? ''), to: String(value) }))
 }
 
+/**
+ * Whether the library marks a record as trashed.
+ *
+ * The local API answers `true` for a boolean field and `1` for the numeric form; both mean trashed,
+ * and the string `'1'` appears in some builds' `format=json` rows.
+ *
+ * @param {unknown} value The `deleted` field of one record.
+ * @returns {boolean} True when the record sits in the trash.
+ */
+export function isDeleted(value) {
+  return value === true || value === 1 || value === '1'
+}
+
+/**
+ * Read one record and everything filed under it, remembering which nodes sit in the trash.
+ *
+ * The graph is what the library holds, not what this file wants it to hold: a parent may be live while
+ * a child is trashed, and a restore has to put every trashed node back, children first.
+ *
+ * @param {string} key An 8-character item key, live or trashed.
+ * @returns {Promise<object>} `{key, version, itemType, title, deleted, children}`.
+ */
+export async function readTrashGraph(key) {
+  const record = await readItem(key)
+  const children = await childrenOf(key)
+  const graph = {
+    key: record.key ?? key,
+    version: record.version,
+    itemType: record.itemType,
+    title: record.title ?? '',
+    deleted: isDeleted(record.deleted),
+    children: [],
+  }
+  for (const child of children) graph.children.push(await readTrashGraph(child.key))
+  return graph
+}
+
+/**
+ * Every node of a trash graph, children before their parent.
+ *
+ * Restoring a parent before its children leaves the children filed under a record that is still
+ * trashed, so the write order is the order this returns.
+ *
+ * @param {object} graph A graph from {@link readTrashGraph}.
+ * @returns {object[]} The nodes without their `children` lists, deepest first.
+ */
+export function flattenTrashGraph(graph) {
+  return [...graph.children.flatMap(flattenTrashGraph), { ...graph, children: undefined }]
+}
+
+/**
+ * Which single maintenance action the flags ask for.
+ *
+ * @param {object} options Parsed flags.
+ * @returns {'edit'|'restore'|'note'|'purge'} The action.
+ * @throws {UsageError} When none or more than one action is asked for, or a flag does not belong to it.
+ */
+export function resolveAction(options) {
+  const chosen = [
+    options.sets.length + options.add.length + options.remove.length > 0 ? 'edit' : '',
+    options.restore.length > 0 ? 'restore' : '',
+    options.note ? 'note' : '',
+    options.purgeTags.length > 0 ? 'purge' : '',
+  ].filter(Boolean)
+  if (chosen.length === 0) {
+    throw new UsageError('pass one action: --set/--add-tag/--remove-tag, --restore, --note with --text, or --purge-tag')
+  }
+  if (chosen.length > 1) throw new UsageError(`pass ONE action, not ${chosen.join(' + ')}`)
+  const [action] = chosen
+  if (action === 'edit' && options.items.length === 0) throw new UsageError('pass --item <key>')
+  if (action !== 'edit' && options.items.length > 0) throw new UsageError(`--item does not apply to --${action}`)
+  if (action === 'note' && options.text === null) throw new UsageError('pass --text <html> with --note <key>')
+  if (action !== 'note' && options.text !== null) throw new UsageError('--text only applies to --note')
+  return action
+}
+
 const USAGE =
-  'usage: node tools/zotero-edit.mjs --item <key> [--set field=value ...] [--add-tag T] [--remove-tag T] [--write]\n' +
+  'usage: node tools/zotero-edit.mjs --item <key[,key...]> [--set field=value ...] [--add-tag T] [--remove-tag T] [--write]\n' +
+  '       node tools/zotero-edit.mjs --restore <key[,key...]> [--write]\n' +
+  '       node tools/zotero-edit.mjs --note <key> --text <html> [--write]\n' +
+  '       node tools/zotero-edit.mjs --purge-tag <tag> [--write]\n' +
   `       editable fields: ${EDITABLE_FIELDS.join(', ')}`
 
 function parseArgs(argv) {
-  const options = { key: '', sets: [], add: [], remove: [], write: false }
+  const options = {
+    items: [],
+    sets: [],
+    add: [],
+    remove: [],
+    write: false,
+    restore: [],
+    note: '',
+    text: null,
+    purgeTags: [],
+  }
+  const valued = ['--item', '--set', '--add-tag', '--remove-tag', '--restore', '--note', '--text', '--purge-tag']
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index]
-    const next = argv[index + 1]
     if (flag === '--write') {
       options.write = true
       continue
     }
-    if (!['--item', '--set', '--add-tag', '--remove-tag'].includes(flag)) {
-      throw new UsageError(`unrecognised argument '${flag}'`)
-    }
-    if (!next) throw new UsageError(`${flag} needs a value`)
-    if (flag === '--item') options.key = next
+    if (!valued.includes(flag)) throw new UsageError(`unrecognised argument '${flag}'`)
+    const next = argv[index + 1]
+    if (next === undefined) throw new UsageError(`${flag} needs a value`)
+    if (flag === '--item') options.items.push(next)
     if (flag === '--set') options.sets.push(next)
     if (flag === '--add-tag') options.add.push(next)
     if (flag === '--remove-tag') options.remove.push(next)
+    if (flag === '--restore') options.restore.push(next)
+    if (flag === '--note') options.note = next
+    if (flag === '--text') options.text = next
+    if (flag === '--purge-tag') options.purgeTags.push(next)
     index += 1
   }
-  if (!options.key) throw new UsageError('pass --item <key>')
-  if (options.sets.length === 0 && options.add.length === 0 && options.remove.length === 0) {
-    throw new UsageError('pass at least one --set, --add-tag or --remove-tag')
-  }
-  return options
+  return { ...options, items: parseItemKeys(options.items), restore: parseItemKeys(options.restore) }
+}
+
+/** Order two exit codes by what the caller should act on: unconfirmed outranks refused. */
+function worseExit(current, next) {
+  const rank = (code) => (code === 3 ? 3 : code === 1 ? 2 : 0)
+  return rank(next) > rank(current) ? next : current
 }
 
 function printConflict(key, result, current) {
@@ -201,59 +337,62 @@ function printConflict(key, result, current) {
   }
 }
 
-async function main() {
-  const options = parseArgs(process.argv.slice(2))
-  const fields = parseSetFlags(options.sets)
-  const gate = createWriteGate({ appName: APP_NAME })
-  const info = await gate.open()
-
-  const before = await readItem(options.key)
+/**
+ * Plan and, with `write`, apply one field/tag patch to one record.
+ *
+ * @returns {Promise<number>} 0 planned or applied, 1 refused, 3 unconfirmed.
+ */
+async function editOne({ gate, key, fields, add, remove, write, single }) {
+  let before
+  try {
+    before = await readItem(key)
+  } catch (error) {
+    console.error(`item ${key}: ${error.message}`)
+    return 1
+  }
   const validFields = await fieldNamesForType(before.itemType)
   const invalid = invalidFields(fields, validFields)
   if (invalid.length > 0) {
-    throw new Refusal(`${before.itemType} has no field named ${invalid.map((field) => `'${field}'`).join(', ')}`, {
-      fix: 'read the fields this item type accepts, then correct the plan',
-      command: `node "${READ_TOOL}" --item-fields ${before.itemType}`,
-    })
+    if (single) {
+      throw new Refusal(`${before.itemType} has no field named ${invalid.map((field) => `'${field}'`).join(', ')}`, {
+        fix: 'read the fields this item type accepts, then correct the plan',
+        command: `node "${READ_TOOL}" --item-fields ${before.itemType}`,
+      })
+    }
+    console.error(`item ${key}: ${before.itemType} has no field named ${invalid.join(', ')}; skipped`)
+    return 1
   }
   const currentTags = normalizeTags(before.tags)
-  const tagChange = computeTagChange(currentTags, { add: options.add, remove: options.remove })
+  const tagChange = computeTagChange(currentTags, { add, remove })
   const patch = { ...fields }
   if (!tagChange.unchanged) patch.tags = tagChange.next.map((tag) => ({ tag }))
   const changes = changedFields(before, patch)
 
-  console.log(`library : Zotero ${info.version} · server ${info.id}`)
-  console.log(`item    : ${options.key}  [${before.itemType}]  "${before.title ?? ''}"`)
+  console.log(`\nitem    : ${key}  [${before.itemType}]  "${before.title ?? ''}"`)
   console.log(`version : ${before.version}`)
 
   if (changes.length === 0) {
-    console.log('\nNo change: every value asked for is already what the record says. Nothing to write.')
-    return
+    console.log('No change: every value asked for is already what the record says.')
+    return 0
   }
   for (const change of changes) {
     if (change.field === 'tags') {
       console.log(`tags    : ${currentTags.join(' · ') || 'none'}`)
       console.log(`       -> : ${tagChange.next.join(' · ') || 'none'}`)
-      console.log(
-        `       +  : ${tagChange.added.join(' · ') || 'none'}   -  : ${tagChange.removed.join(' · ') || 'none'}`,
-      )
+      console.log(`       +  : ${tagChange.added.join(' · ') || 'none'}   -  : ${tagChange.removed.join(' · ') || 'none'}`)
     } else {
       console.log(`${change.field.padEnd(7)} : ${JSON.stringify(change.from)}`)
       console.log(`     -> : ${JSON.stringify(change.to)}`)
     }
   }
   console.log(`body    : ${JSON.stringify(patch)}`)
-  console.log(`write   : PATCH /api/users/0/items/${options.key}  If-Unmodified-Since-Version: ${before.version}`)
+  console.log(`write   : PATCH /api/users/0/items/${key}  If-Unmodified-Since-Version: ${before.version}`)
 
-  if (!options.write) {
-    console.log('\nDRY RUN - nothing was written. Re-run with --write; the reference manager will then')
-    console.log('ask you to Allow the write, and is asked once.')
-    return
-  }
+  if (!write) return 0
 
   const result = await patchItem({
     gate,
-    key: options.key,
+    key,
     patch,
     apply: true,
     beforeWrite: () => {
@@ -261,21 +400,20 @@ async function main() {
     },
   })
   if (result.conflict) {
-    printConflict(options.key, { patch }, result.before)
-    process.exitCode = 1
-    return
+    printConflict(key, { patch }, result.before)
+    return 1
   }
   if (!result.applied) {
     if (mayHaveLanded(result.status)) {
       // The item exists either way, so the honest report names it and says what a re-read shows:
       // a 5xx after a sent PATCH is not a refusal, and "nothing was written" would invite a resend.
-      const after = await readItem(options.key).catch(() => null)
+      const after = await readItem(key).catch(() => null)
       const left = after
         ? fieldsNotReadBack(after, changes, tagChange)
         : ['the re-read failed too, so even this is unproven']
-      process.exitCode = reportUnconfirmed({
-        key: options.key,
-        what: `the ${fieldsOf(changes)} change on ${options.key} answered HTTP ${result.status}${
+      return reportUnconfirmed({
+        key,
+        what: `the ${fieldsOf(changes)} change on ${key} answered HTTP ${result.status}${
           result.detail ? ` (${result.detail.slice(0, 200)})` : ''
         }`,
         found: after
@@ -284,24 +422,262 @@ async function main() {
             : `A re-read does not show ${left.join(', ')}; the library may still have applied it.`
           : 'The re-read that would settle it failed as well.',
       })
+    }
+    console.error(`\nThe library refused the write (HTTP ${result.status}): ${result.detail}`)
+    return 1
+  }
+
+  const after = result.after
+  const mismatched = fieldsNotReadBack(after, changes, tagChange)
+  if (mismatched.length > 0) {
+    return reportUnconfirmed({
+      key,
+      what: `the library accepted the change to ${mismatched.join(', ')} and the record does not read back as sent (version ${after.version})`,
+      found: 'Nothing further was changed. The record holds some other value now - read it before deciding.',
+    })
+  }
+  console.log(`OK - ${key} now reads back with every requested value (version ${after.version}).`)
+  return 0
+}
+
+async function runEdit(options, gate) {
+  const fields = parseSetFlags(options.sets)
+  let code = 0
+  for (const key of options.items) {
+    code = worseExit(
+      code,
+      await editOne({
+        gate,
+        key,
+        fields,
+        add: options.add,
+        remove: options.remove,
+        write: options.write,
+        single: options.items.length === 1,
+      }),
+    )
+  }
+  if (!options.write) {
+    console.log('\nDRY RUN - nothing was written. Re-run with --write; the reference manager will then')
+    console.log('ask you to Allow the write, and is asked once per record that actually changes.')
+  }
+  process.exitCode = code
+}
+
+/**
+ * Plan and, with `write`, restore one trashed record and every trashed node filed under it.
+ *
+ * @returns {Promise<number>} 0 restored or already live, 1 refused, 3 unconfirmed.
+ */
+async function restoreOne({ gate, key, write }) {
+  let graph
+  try {
+    graph = await readTrashGraph(key)
+  } catch (error) {
+    console.error(`item ${key}: ${error.message}`)
+    return 1
+  }
+  const nodes = flattenTrashGraph(graph)
+  const trashed = nodes.filter((node) => node.deleted)
+  console.log(`\nitem    : ${key}  [${graph.itemType}]  "${graph.title}"`)
+  console.log(`graph   : ${nodes.length} node(s), ${trashed.length} in the trash`)
+  for (const node of nodes) {
+    console.log(`  ${node.deleted ? 'trash' : 'live '} ${node.key}  ${node.itemType}  v${node.version}`)
+  }
+  if (trashed.length === 0) {
+    console.log('Nothing to restore: every node in this graph is already live.')
+    return 0
+  }
+  for (const node of trashed) {
+    console.log(`restore : PATCH /api/users/0/items/${node.key} {deleted:0}  If-Unmodified-Since-Version: ${node.version}`)
+  }
+  if (!write) {
+    console.log('\nDRY RUN - nothing was written. Re-run with --write to put these nodes back, children first.')
+    return 0
+  }
+  for (const node of trashed) {
+    const result = await patchItem({
+      gate,
+      key: node.key,
+      patch: { deleted: 0 },
+      apply: true,
+      beforeWrite: () => {
+        writeAttempted = true
+      },
+    })
+    if (result.conflict) {
+      printConflict(node.key, { patch: { deleted: 0 } }, result.before)
+      return 1
+    }
+    if (!result.applied) {
+      if (mayHaveLanded(result.status)) {
+        return reportUnconfirmed({
+          key: node.key,
+          what: `restoring ${node.key} answered HTTP ${result.status}`,
+          found: 'Some nodes may already be back. Read the graph before deciding, and do not resend the whole plan.',
+        })
+      }
+      console.error(`\nThe library refused to restore ${node.key} (HTTP ${result.status}): ${result.detail}`)
+      return 1
+    }
+  }
+  const after = flattenTrashGraph(await readTrashGraph(key))
+  const stillTrashed = after.filter((node) => node.deleted).map((node) => node.key)
+  const beforeKeys = nodes.map((node) => node.key).sort()
+  const afterKeys = after.map((node) => node.key).sort()
+  if (stillTrashed.length > 0 || JSON.stringify(beforeKeys) !== JSON.stringify(afterKeys)) {
+    return reportUnconfirmed({
+      key,
+      what: `the restore of ${key} was accepted but the graph does not read back cleanly`,
+      found: stillTrashed.length > 0
+        ? `Still in the trash: ${stillTrashed.join(', ')}.`
+        : 'The node set changed between the plan and the re-read.',
+    })
+  }
+  console.log(`\nOK - ${key} and ${nodes.length - 1} child node(s) are live (version ${graph.version} was the plan).`)
+  return 0
+}
+
+async function runRestore(options, gate) {
+  let code = 0
+  for (const key of options.restore) code = worseExit(code, await restoreOne({ gate, key, write: options.write }))
+  process.exitCode = code
+}
+
+/** Replace one note's body, read back the result, and report a mismatch honestly. */
+async function runNote(options, gate) {
+  const key = options.note
+  const before = await readItem(key)
+  if (before.itemType !== 'note') {
+    throw new Refusal(`item ${key} is a ${before.itemType}, not a note`, {
+      fix: 'address the note itself by its own key; zotero-read --item prints the notes a paper has',
+      command: `node "${READ_TOOL}" --item ${key}`,
+    })
+  }
+  console.log(`item    : ${key}  [note]  child of ${before.parentItem ?? 'the library root'}`)
+  console.log(`version : ${before.version}`)
+  if (String(before.note ?? '') === options.text) {
+    console.log('No change: the note already holds exactly that text.')
+    return
+  }
+  console.log(`body    : ${JSON.stringify(options.text)}`)
+  console.log(`write   : PATCH /api/users/0/items/${key}  If-Unmodified-Since-Version: ${before.version}`)
+  if (!options.write) {
+    console.log('\nDRY RUN - nothing was written. Re-run with --write to replace the note body.')
+    return
+  }
+  const result = await patchItem({
+    gate,
+    key,
+    patch: { note: options.text },
+    apply: true,
+    beforeWrite: () => {
+      writeAttempted = true
+    },
+  })
+  if (result.conflict) {
+    printConflict(key, { patch: { note: options.text } }, result.before)
+    process.exitCode = 1
+    return
+  }
+  if (!result.applied) {
+    if (mayHaveLanded(result.status)) {
+      process.exitCode = reportUnconfirmed({
+        key,
+        what: `the note update answered HTTP ${result.status}`,
+        found: 'The note may already hold the new body. Read it before resending.',
+      })
       return
     }
     console.error(`\nThe library refused the write (HTTP ${result.status}): ${result.detail}`)
     process.exitCode = 1
     return
   }
-
-  const after = result.after
-  const mismatched = fieldsNotReadBack(after, changes, tagChange)
-  if (mismatched.length > 0) {
+  if (String(result.after.note ?? '') !== options.text) {
     process.exitCode = reportUnconfirmed({
-      key: options.key,
-      what: `the library accepted the change to ${mismatched.join(', ')} and the record does not read back as sent (version ${after.version})`,
-      found: 'Nothing further was changed. The record holds some other value now - read it before deciding.',
+      key,
+      what: `the library accepted the new note body and the record reads back differently (version ${result.after.version})`,
+      found: 'Read the note before deciding; nothing further was changed.',
     })
     return
   }
-  console.log(`\nOK - ${options.key} now reads back with every requested value (version ${after.version}).`)
+  console.log(`\nOK - ${key} now reads back with the new body (version ${result.after.version}).`)
+}
+
+/**
+ * Delete tags from the whole library.
+ *
+ * A tag exists only as long as some record carries it, so this is a library-wide operation with one
+ * version precondition - not a per-record edit. The local API deletes a tag by name, which is why the
+ * plan names every tag and nothing else.
+ */
+/**
+ * Every tag name the library still holds, read back in pages so a large library is not truncated.
+ *
+ * @returns {Promise<string[]>} The tag names.
+ */
+async function tagNamesInLibrary() {
+  const names = []
+  for (let start = 0; ; start += 100) {
+    const page = await getJson(`/api/users/0/tags?format=json&limit=100&start=${start}`)
+    names.push(...page.map((row) => row.tag))
+    if (page.length < 100) return names
+  }
+}
+
+async function runPurge(options, gate) {
+  const tags = [...new Set(options.purgeTags)]
+  const probe = await libraryVersion()
+  const path = `/api/users/0/tags?tag=${tags.map((tag) => encodeURIComponent(tag)).join('||')}`
+  console.log(`tags    : ${tags.join(' · ')}`)
+  console.log(`library : version ${probe.version}`)
+  console.log(`write   : DELETE ${path}`)
+  if (!options.write) {
+    console.log('\nDRY RUN - nothing was written. Re-run with --write to delete these tags from every record.')
+    return
+  }
+  writeAttempted = true
+  const res = await gate.write('DELETE', path, undefined, {
+    'If-Unmodified-Since-Version': String(probe.version),
+  })
+  if (isWriteAccepted(res.status)) {
+    const remaining = await tagNamesInLibrary().catch(() => null)
+    if (remaining === null || tags.some((tag) => remaining.includes(tag))) {
+      process.exitCode = reportUnconfirmed({
+        key: '',
+        what:
+          remaining === null
+            ? `the tag delete answered HTTP ${res.status} but the tags could not be re-read`
+            : `the delete answered HTTP ${res.status} and ${tags.filter((tag) => remaining.includes(tag)).join(', ')} still exists`,
+        found: 'Read the tag list before resending.',
+      })
+      return
+    }
+    console.log(`\nOK - ${tags.length === 1 ? 'the tag is' : 'the tags are'} gone from the library (HTTP ${res.status}).`)
+    return
+  }
+  if (mayHaveLanded(res.status)) {
+    process.exitCode = reportUnconfirmed({
+      key: '',
+      what: `the tag delete answered HTTP ${res.status}`,
+      found: 'The library may already have deleted them; browse the tags before resending.',
+    })
+    return
+  }
+  console.error(`\nThe library refused the delete (HTTP ${res.status}): ${res.text.slice(0, 300)}`)
+  process.exitCode = 1
+}
+
+async function main() {
+  const options = parseArgs(process.argv.slice(2))
+  const action = resolveAction(options)
+  const gate = createWriteGate({ appName: APP_NAME })
+  const info = await gate.open()
+  console.log(`library : Zotero ${info.version} · server ${info.id}`)
+  if (action === 'edit') return runEdit(options, gate)
+  if (action === 'restore') return runRestore(options, gate)
+  if (action === 'note') return runNote(options, gate)
+  return runPurge(options, gate)
 }
 
 /** The fields a change list names, in one phrase. */

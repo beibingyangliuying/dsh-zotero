@@ -32,6 +32,8 @@
 //   node tools/zotero-write.mjs --arxiv 1706.03762 --write
 //   node tools/zotero-write.mjs --doi 10.1371/journal.pone.0171234 --write
 //   node tools/zotero-write.mjs --doi 10.1371/journal.pone.0171234 --collection ABCDEFGH --write
+//   node tools/zotero-write.mjs --item-type book --field title="..." --creator "Last, First" --write
+//   node tools/zotero-write.mjs --note "<p>body</p>" --parent ABCDEFGH --write
 //   node tools/zotero-write.mjs --selftest                    # no writes, checks the seams
 //
 // Exit codes: 0 created and read back, or nothing to do (a dry run, or a record already in the
@@ -56,6 +58,10 @@ import { UsageError, reportFailure, reportHelp, wantsHelp } from './refusal.mjs'
 const USAGE =
   'usage: node tools/zotero-write.mjs --arxiv <id> [--collection <key> ...] [--force] [--write]\n' +
   '       node tools/zotero-write.mjs --doi <doi> [--collection <key> ...] [--force] [--write]\n' +
+  '       node tools/zotero-write.mjs --item-type <type> --field k=v [--field k=v ...]\n' +
+  '                                   [--creator "Last, First" ...] [--tag <tag> ...]\n' +
+  '                                   [--collection <key> ...] [--force] [--write]\n' +
+  '       node tools/zotero-write.mjs --note <html> [--parent <key>] [--write]\n' +
   '       node tools/zotero-write.mjs --selftest\n' +
   '       a dry run unless --write is given; a record already in the library is left alone unless\n' +
   '       --force is passed. Exit 3 means a record may exist: search for it before creating it again.'
@@ -74,6 +80,14 @@ const flag = (name) => argv.includes(`--${name}`)
 const value = (name) => {
   const i = argv.indexOf(`--${name}`)
   return i === -1 ? null : (argv[i + 1] ?? null)
+}
+/** Every value given to one repeatable flag, in order. */
+const values = (name) => {
+  const found = []
+  for (let index = 0; index < argv.length; index += 1) {
+    if (argv[index] === `--${name}` && argv[index + 1] !== undefined) found.push(argv[index + 1])
+  }
+  return found
 }
 const log = (...parts) => console.log(...parts)
 
@@ -121,6 +135,78 @@ export function collectionKeyProblems(keys) {
     }
   }
   return problems
+}
+
+/**
+ * Fields that a manual create cannot take as `--field`, each with the flag that does express it.
+ *
+ * The library calls every one of these structured or assigned, so a bare string would either be
+ * rejected or silently lose the structure - exactly the kind of write this tool refuses.
+ */
+export const REFUSED_MANUAL_FIELDS = {
+  itemType: 'the type is its own flag: --item-type <type>',
+  creators: 'use --creator "Last, First" (repeatable)',
+  tags: 'use --tag <tag> (repeatable)',
+  collections: 'use --collection <key> (repeatable)',
+  key: 'the library assigns the key',
+  version: 'the library assigns the version',
+}
+
+/**
+ * Read `--field field=value` arguments for a manual create.
+ *
+ * @param {string[]} args Command-line arguments.
+ * @returns {Record<string, string>} field -> value, later flags winning.
+ * @throws {UsageError} For a missing value, a missing `=`, or a structured field.
+ */
+export function parseFieldFlags(args) {
+  const fields = {}
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] !== '--field') continue
+    const assignment = args[index + 1]
+    if (assignment === undefined || assignment.startsWith('--')) throw new UsageError('--field needs field=value')
+    const split = assignment.indexOf('=')
+    if (split === -1) throw new UsageError(`--field takes field=value, got '${assignment}'`)
+    const field = assignment.slice(0, split).trim()
+    const content = assignment.slice(split + 1)
+    if (REFUSED_MANUAL_FIELDS[field]) {
+      throw new UsageError(`--field cannot set '${field}': ${REFUSED_MANUAL_FIELDS[field]}`)
+    }
+    fields[field] = content
+  }
+  return fields
+}
+
+/**
+ * One `--creator` value as Zotero's creator shape.
+ *
+ * "Last, First" is the only form that states the family name unambiguously, so a comma flips the
+ * order; without one the last word is taken as the family name, which is what the metadata resolvers
+ * above do with the names they receive.
+ *
+ * @param {string} text A person's name.
+ * @returns {object} `{creatorType, lastName, firstName}` or `{creatorType, name}` for one-word names.
+ * @throws {UsageError} When the value is empty.
+ */
+export function creatorFromExpression(text) {
+  const raw = String(text ?? '').trim()
+  if (raw === '') throw new UsageError('--creator needs a name')
+  if (raw.includes(',')) {
+    const [last, ...rest] = raw.split(',')
+    return { creatorType: 'author', lastName: last.trim(), firstName: rest.join(',').trim() }
+  }
+  return splitName(raw)
+}
+
+/**
+ * The POST body for a note.
+ *
+ * @param {string} html The note body.
+ * @param {string} [parentItem] The record it is filed under; `''` makes a standalone note.
+ * @returns {object} The body to POST.
+ */
+export function notePayload(html, parentItem = '') {
+  return parentItem ? { itemType: 'note', note: html, parentItem } : { itemType: 'note', note: html }
 }
 
 /**
@@ -315,19 +401,64 @@ async function allCollections() {
   }
 }
 
+/** The sources named by the flags, so two of them are refused rather than silently picking one. */
+function sourceFlags() {
+  const present = []
+  if (value('arxiv')) present.push('arxiv')
+  if (value('doi')) present.push('doi')
+  if (value('item-type')) present.push('manual')
+  if (argv.includes('--note')) present.push('note')
+  return present
+}
+
+/** A manual record: the type plus the fields, creators and tags the caller stated. */
+function manualMeta(itemType) {
+  if (!/^[A-Za-z]+$/.test(itemType)) throw new UsageError(`'${itemType}' is not an item type name`)
+  const fields = parseFieldFlags(argv)
+  if (!fields.title) throw new UsageError('a manual record needs at least --field title=...')
+  if (value('parent')) throw new UsageError('--parent only applies to --note')
+  return {
+    itemType,
+    ...fields,
+    creators: values('creator').map(creatorFromExpression),
+    tags: values('tag').map((tag) => ({ tag })),
+    manual: true,
+  }
+}
+
 async function resolve() {
-  const arxiv = value('arxiv')
-  const doi = value('doi')
-  if (arxiv) return { source: `arXiv ${arxiv}`, meta: await metadataFromArxiv(arxiv) }
-  if (doi) return { source: `DOI ${doi}`, meta: await metadataFromCrossref(doi) }
-  throw new UsageError('pass --arxiv <id> or --doi <doi>')
+  const sources = sourceFlags()
+  if (sources.length === 0) {
+    throw new UsageError('pass --arxiv <id>, --doi <doi>, --item-type <type> with --field, or --note <html>')
+  }
+  if (sources.length > 1) throw new UsageError(`pass ONE source, not ${sources.join(' + ')}`)
+  const [source] = sources
+  if (source === 'arxiv') return { source: `arXiv ${value('arxiv')}`, meta: await metadataFromArxiv(value('arxiv')) }
+  if (source === 'doi') return { source: `DOI ${value('doi')}`, meta: await metadataFromCrossref(value('doi')) }
+  if (source === 'manual') return { source: `manual ${value('item-type')}`, meta: manualMeta(value('item-type')) }
+  if (value('creator') !== null || values('tag').length > 0) {
+    throw new UsageError('--creator and --tag apply to --item-type, not --note')
+  }
+  const html = value('note') ?? ''
+  if (html === '') throw new UsageError('--note needs the note body (HTML)')
+  const parentItem = value('parent') ?? ''
+  if (parentItem && !KEY_SHAPE.test(parentItem)) {
+    throw new UsageError(`--parent "${parentItem}" is not an eight-character item key`)
+  }
+  return {
+    source: `note (${html.length} characters)`,
+    meta: { itemType: 'note', title: '', creators: [], noteItem: true, note: html, parentItem },
+  }
 }
 
 /** Build the payload without writing anything. Shared by the dry run, the write and the test. */
 async function buildPayload(meta) {
   const template = await emptyItem(meta.itemType)
   const creatorType = await creatorTypeFor(meta.itemType)
-  const withCreators = { ...meta, creators: meta.creators.map((c) => ({ ...c, creatorType })) }
+  // `tags` and the bookkeeping flags are not schema fields: tags are attached after the template is
+  // filled, and the flags would otherwise be reported as fields the type dropped.
+  const { tags, manual, noteItem, note, parentItem, ...fields } = meta
+  const withCreators = { ...fields, creators: meta.creators.map((c) => ({ ...c, creatorType })) }
   return fillTemplate(template, withCreators)
 }
 
@@ -335,7 +466,7 @@ async function run() {
   // Refused before the first request, so a bad argument costs no authorization dialog and no network.
   const wanted = parseCollectionKeys(argv)
   const keyProblems = collectionKeyProblems(wanted)
-  if (keyProblems.length) throw new Error(keyProblems.join('; '))
+  if (keyProblems.length) throw new UsageError(keyProblems.join('; '))
 
   const gate = createWriteGate({
     appName: APP_NAME,
@@ -351,7 +482,15 @@ async function run() {
   log(`[1] Zotero ${version}, server id ${serverId}${kept ? ' — a kept authorization is on file' : ''}`)
 
   const { source, meta } = await resolve()
-  log(`[2] ${source} -> "${meta.title}" (${meta.creators.length} creators, ${meta.date || 'no date'})`)
+  log(
+    `[2] ${source} -> ${
+      meta.noteItem
+        ? `note${meta.parentItem ? ` under ${meta.parentItem}` : ' (standalone)'}`
+        : `"${meta.title}" (${meta.creators.length} creators, ${meta.date || 'no date'})`
+    }`,
+  )
+
+  if (meta.noteItem && wanted.length) throw new UsageError('a note is filed with its parent; --collection does not apply')
 
   if (wanted.length) {
     const rows = await allCollections()
@@ -365,15 +504,32 @@ async function run() {
     log(`    filing    : ${names.join(' · ')} — carried by this create, not a second write`)
   }
 
-  const { item: bare, used, dropped } = await buildPayload(meta)
-  const item = withCollections(bare, wanted)
-  log(`[3] item type ${meta.itemType}: filled ${used.length} field(s): ${used.join(', ')}`)
-  if (dropped.length) log(`    dropped (not valid for this type): ${dropped.join(', ')}`)
+  let item
+  let used = []
+  let dropped = []
+  if (meta.noteItem) {
+    if (meta.parentItem) {
+      const parent = await readItem(meta.parentItem)
+      if (parent.itemType === 'note') throw new UsageError('a note cannot be filed under another note')
+    }
+    item = notePayload(meta.note, meta.parentItem)
+  } else {
+    const { item: bare, used: filled, dropped: lost } = await buildPayload(meta)
+    used = filled
+    dropped = lost
+    item = withCollections(bare, wanted)
+    if (meta.tags?.length) item = { ...item, tags: meta.tags }
+  }
+  log(`[3] item type ${item.itemType}: filled ${used.length} field(s)${used.length ? `: ${used.join(', ')}` : ''}`)
+  if (dropped.length) {
+    if (meta.manual) throw new UsageError(`--field names fields this type does not have: ${dropped.join(', ')}`)
+    log(`    dropped (not valid for this type): ${dropped.join(', ')}`)
+  }
 
   log('[4] payload:')
   log(JSON.stringify([item], null, 2).split('\n').map((l) => `    ${l}`).join('\n'))
 
-  const existing = await findExisting(meta)
+  const existing = meta.noteItem ? null : await findExisting(meta)
   if (existing) log(`[!] already in the library as ${existing.key} — "${existing.title}"`)
 
   if (!flag('write')) {
@@ -425,10 +581,14 @@ async function run() {
   log(`[6] created item ${itemKey}`)
 
   const back = await readItem(itemKey)
-  const titleOk = back.title === item.title
-  const doiOk = !item.DOI || back.DOI === item.DOI
-  const creatorsOk = (back.creators ?? []).length === item.creators.length
-  const unfiled = unfiledCollections(wanted, back.collections)
+  const checks = meta.noteItem
+    ? [{ label: 'note body', ok: String(back.note ?? '') === meta.note, detail: '' }]
+    : [
+        { label: 'title', ok: back.title === item.title, detail: ` ("${back.title}")` },
+        { label: 'DOI', ok: !item.DOI || back.DOI === item.DOI, detail: '' },
+        { label: 'creators', ok: (back.creators ?? []).length === item.creators.length, detail: ` (${item.creators.length})` },
+      ]
+  const unfiled = meta.noteItem ? [] : unfiledCollections(wanted, back.collections)
   const filingNote =
     wanted.length === 0
       ? 'not asked'
@@ -436,17 +596,16 @@ async function run() {
         ? `matches (${wanted.join(' · ')})`
         : `MISSING (${unfiled.join(' · ')})`
   log(
-    `[7] read-back: title ${titleOk ? 'matches' : `MISMATCH ("${back.title}")`}, ` +
-      `DOI ${doiOk ? 'matches' : 'MISMATCH'}, creators ${creatorsOk ? `matches (${item.creators.length})` : 'MISMATCH'}, ` +
-      `filing ${filingNote}`,
+    `[7] read-back: ${checks
+      .map((check) => `${check.label} ${check.ok ? 'matches' : `MISMATCH${check.detail}`}`)
+      .join(', ')}, filing ${filingNote}`,
   )
-  if (!titleOk || !doiOk || !creatorsOk) {
+  const failed = checks.filter((check) => !check.ok)
+  if (failed.length > 0) {
     process.exitCode = reportUnconfirmed({
       key: itemKey,
-      what: `the record was created and does not read back as sent (title ${titleOk ? 'ok' : 'differs'}, DOI ${
-        doiOk ? 'ok' : 'differs'
-      }, creators ${creatorsOk ? 'ok' : 'differ'})`,
-      found: 'Read it before editing it: a second create would leave two records for one paper.',
+      what: `the record was created and ${failed.map((check) => check.label).join(', ')} does not read back as sent`,
+      found: 'Read it before editing it: a second create would leave two records for one work.',
     })
     return
   }
@@ -466,7 +625,7 @@ async function run() {
     return
   }
   const where = wanted.length === 0 ? '' : `, filed under ${wanted.join(' · ')}`
-  log(`\nOK — "${back.title}" is now in the library (key ${itemKey}${where}).`)
+  log(`\nOK — ${meta.noteItem ? 'the note' : `"${back.title}"`} is now in the library (key ${itemKey}${where}).`)
 }
 
 async function selftest() {

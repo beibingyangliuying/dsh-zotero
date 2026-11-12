@@ -19,7 +19,14 @@ import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { nextCollections, siblingWithName } from '../zotero-collection.mjs'
+import {
+  describeConditions,
+  nextCollections,
+  normalizeSearch,
+  sameConditions,
+  searchConditions,
+  siblingWithName,
+} from '../zotero-collection.mjs'
 
 let failures = 0
 const check = (condition, label, detail = '') => {
@@ -84,6 +91,32 @@ check(
 )
 check(nextCollections([], 'A', { remove: true }).changed === false, 'removing from nothing changes nothing')
 
+console.log('\n[2b] a saved search is a name plus one query condition')
+
+check(
+  JSON.stringify(searchConditions('graph neural')) ===
+    '[{"condition":"quicksearch","operator":"contains","value":"graph neural"}]',
+  '--query becomes the "Search terms contains" condition the library itself stores',
+)
+check(normalizeSearch({ key: 'S1', version: 4, data: { name: 'Mine', conditions: [] } }).key === 'S1', 'a row with data nests the fields')
+check(normalizeSearch({ key: 'S1', version: 4, name: 'Mine' }).version === 4, 'a flat row works too')
+check(normalizeSearch({}).conditions.length === 0, 'a search without conditions has an empty list, not undefined')
+check(describeConditions(searchConditions('x')).includes('quicksearch contains "x"'), 'the plan line says what it matches')
+check(
+  sameConditions(searchConditions('x'), [
+    { condition: 'groupStart', operator: '', value: '' },
+    { condition: 'joinMode', operator: 'any', value: '' },
+    { condition: 'field', operator: 'contains', value: 'x' },
+    { condition: 'tag', operator: 'contains', value: 'x' },
+    { condition: 'groupEnd', operator: '', value: '' },
+  ]),
+  'a quicksearch reads back expanded into clauses, and still counts as the same search',
+)
+check(
+  !sameConditions(searchConditions('x'), [{ condition: 'field', operator: 'contains', value: 'y' }]),
+  'a clause holding a different term is a different search',
+)
+
 console.log("\n[3] the command line against a stub library, not the owner's")
 
 const scratch = mkdtempSync(join(tmpdir(), 'collection-cli-'))
@@ -96,29 +129,40 @@ const baseCollections = () => [
 const baseItems = () => ({
   ITEMAAAA: { key: 'ITEMAAAA', itemType: 'journalArticle', title: 'A paper', collections: [], version: 5 },
 })
+const baseSearches = () => [
+  { key: 'SEARCH01', version: 2, data: { name: 'Old search', conditions: searchConditions('old') } },
+]
 
 // The library the tool talks to, and the hooks a scenario replaces. A hook that is null means "behave
 // like the thing the tool was measured against"; a scenario sets one to answer differently.
 const stub = {
   collections: baseCollections(),
   items: baseItems(),
+  searches: baseSearches(),
   requests: [],
   created: 0,
   authorize: () => ({ status: 200, body: { key: 'stub-key', remember: false } }),
   createCollection: null,
   patchCollection: null,
   patchItem: null,
+  deleteCollection: null,
+  patchSearch: null,
+  deleteSearch: null,
 }
 
 const resetLibrary = () => {
   stub.collections = baseCollections()
   stub.items = baseItems()
+  stub.searches = baseSearches()
   stub.requests.length = 0
   stub.created = 0
   stub.authorize = () => ({ status: 200, body: { key: 'stub-key', remember: false } })
   stub.createCollection = null
   stub.patchCollection = null
   stub.patchItem = null
+  stub.deleteCollection = null
+  stub.patchSearch = null
+  stub.deleteSearch = null
 }
 
 const addCollection = (name, parentCollection) => {
@@ -205,7 +249,79 @@ const server = createServer((req, res) => {
       })
       return
     }
+    if (req.method === 'DELETE') {
+      const expected = req.headers['if-unmodified-since-version']
+      if (stub.deleteCollection) {
+        answerPatch(stub.deleteCollection(row, expected))
+        return
+      }
+      if (String(expected) !== String(row.version)) {
+        send(412, { error: 'the version moved' })
+        return
+      }
+      const doomed = new Set([row.key])
+      let grew = true
+      while (grew) {
+        grew = false
+        for (const each of stub.collections) {
+          if (!doomed.has(each.key) && doomed.has(each.data?.parentCollection || '')) {
+            doomed.add(each.key)
+            grew = true
+          }
+        }
+      }
+      stub.collections = stub.collections.filter((each) => !doomed.has(each.key))
+      noContent()
+      return
+    }
     send(200, { data: { ...row.data, version: row.version } })
+    return
+  }
+  if (path === '/api/users/0/searches' && req.method === 'GET') {
+    send(200, stub.searches)
+    return
+  }
+  if (path === '/api/users/0/searches' && req.method === 'POST') {
+    readBody((raw) => {
+      const payload = JSON.parse(raw)
+      const search = payload[0] ?? payload
+      const key = `SEARCH${String(stub.searches.length + 2).padStart(2, '0')}`
+      stub.searches.push({ key, version: 1, data: { name: search.name, conditions: search.conditions } })
+      send(200, { successful: { 0: key } })
+    })
+    return
+  }
+  const searchPrefix = '/api/users/0/searches/'
+  if (path.startsWith(searchPrefix)) {
+    const key = path.slice(searchPrefix.length)
+    const row = stub.searches.find((each) => each.key === key)
+    if (!row) {
+      send(404, { error: 'not found' })
+      return
+    }
+    if (req.method === 'PATCH') {
+      readBody((raw) => {
+        const patch = JSON.parse(raw)
+        const expected = req.headers['if-unmodified-since-version']
+        answerPatch(stub.patchSearch ? stub.patchSearch(row, patch, expected) : patchRow(row, patch, expected, row.data))
+      })
+      return
+    }
+    if (req.method === 'DELETE') {
+      const expected = req.headers['if-unmodified-since-version']
+      if (stub.deleteSearch) {
+        answerPatch(stub.deleteSearch(row, expected))
+        return
+      }
+      if (String(expected) !== String(row.version)) {
+        send(412, { error: 'the version moved' })
+        return
+      }
+      stub.searches = stub.searches.filter((each) => each.key !== row.key)
+      noContent()
+      return
+    }
+    send(200, { key: row.key, version: row.version, data: row.data })
     return
   }
   const itemPath = /^\/api\/users\/0\/items\/([A-Z0-9]+)$/.exec(path)
@@ -374,6 +490,61 @@ check(createsSent() === 0, 'and nothing was sent', String(createsSent()))
 resetLibrary()
 const usage = await runAsync(['--create'])
 check(usage.status === 2, 'a usage error is exit 2', `status ${usage.status}`)
+
+console.log('\n[4] delete and saved searches')
+
+resetLibrary()
+const deletePlan = await runAsync(['--delete', 'ROOTAAAA'])
+check(deletePlan.status === 0, 'a delete dry run exits 0', `status ${deletePlan.status}`)
+check(deletePlan.stdout.includes('DELETE /api/users/0/collections/ROOTAAAA'), 'and prints the request it would send', first(deletePlan.stdout))
+check(!stub.requests.some((line) => line.startsWith('DELETE')), 'and sends no delete', JSON.stringify(stub.requests))
+
+resetLibrary()
+const deleted = await runAsync(['--delete', 'ROOTAAAA', '--write'])
+check(deleted.status === 0, 'a delete the library accepts exits 0', `status ${deleted.status}`)
+check(!stub.collections.some((row) => row.key === 'ROOTAAAA'), 'and the collection is gone from the tree')
+check(deleted.stdout.includes('is gone'), 'and the tool says so', first(deleted.stdout))
+
+resetLibrary()
+stub.deleteCollection = (row) => {
+  row.version += 1
+  return { status: 412 }
+}
+const movedDelete = await runAsync(['--delete', 'ROOTAAAA', '--write'])
+check(movedDelete.status === 1, 'a delete that lost a race is exit 1', `status ${movedDelete.status}`)
+check(movedDelete.stderr.includes('CONFLICT'), 'and it is called a conflict', first(movedDelete.stderr))
+
+resetLibrary()
+const madeSearch = await runAsync(['--saved-search-create', 'Reading', '--query', 'graph neural', '--write'])
+check(madeSearch.status === 0, 'a saved-search create the library accepts exits 0', `status ${madeSearch.status}`)
+check(
+  stub.searches.some((row) => row.data.name === 'Reading' && row.data.conditions[0].value === 'graph neural'),
+  'and the search holds the name and condition',
+)
+check(madeSearch.stdout.includes('reads back'), 'and the read-back is what the tool reports', first(madeSearch.stdout))
+
+resetLibrary()
+const updatedSearch = await runAsync(['--saved-search-update', 'SEARCH01', '--name', 'New search', '--write'])
+check(updatedSearch.status === 0, 'a saved-search rename the library accepts exits 0', `status ${updatedSearch.status}`)
+check(stub.searches[0].data.name === 'New search', 'and the stub library holds the new name')
+
+resetLibrary()
+stub.patchSearch = (row) => {
+  row.version += 1
+  return { status: 412 }
+}
+const movedSearch = await runAsync(['--saved-search-update', 'SEARCH01', '--name', 'New search', '--write'])
+check(movedSearch.status === 1, 'a saved-search update that lost a race is exit 1', `status ${movedSearch.status}`)
+check(movedSearch.stderr.includes('CONFLICT'), 'and it is called a conflict', first(movedSearch.stderr))
+
+resetLibrary()
+const deletedSearch = await runAsync(['--saved-search-delete', 'SEARCH01', '--write'])
+check(deletedSearch.status === 0, 'a saved-search delete the library accepts exits 0', `status ${deletedSearch.status}`)
+check(stub.searches.length === 0, 'and the search is gone')
+
+resetLibrary()
+const noQuery = await runAsync(['--saved-search-create', 'Reading'])
+check(noQuery.status === 2, 'a saved search without --query is a usage error', `status ${noQuery.status}`)
 
 server.close()
 

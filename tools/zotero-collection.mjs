@@ -35,8 +35,12 @@
 //   node tools/zotero-collection.mjs --create "Reading list" --parent <collectionKey>   # dry run
 //   node tools/zotero-collection.mjs --create "Reading list" --write
 //   node tools/zotero-collection.mjs --rename <collectionKey> --name "Archive" --write  # measured 2026-10-16
+//   node tools/zotero-collection.mjs --delete <collectionKey> --write
 //   node tools/zotero-collection.mjs --assign <itemKey> --collection <collectionKey> --write
 //   node tools/zotero-collection.mjs --assign <itemKey> --collection <collectionKey> --remove --write
+//   node tools/zotero-collection.mjs --saved-search-create "Reading" --query "graph neural" --write
+//   node tools/zotero-collection.mjs --saved-search-update <searchKey> --name "Reading 2026" --write
+//   node tools/zotero-collection.mjs --saved-search-delete <searchKey> --write
 //
 // Exit codes: 0 applied and read back, or nothing to do | 1 refused, nothing written | 2 usage |
 // 3 sent or written but unconfirmed - the tree or the record may already carry the change, so read it
@@ -93,15 +97,81 @@ export function nextCollections(current, collectionKey, { remove = false } = {})
   return { next, changed: JSON.stringify(next) !== JSON.stringify(current) }
 }
 
+/**
+ * The condition list a --query saved search carries.
+ *
+ * Zotero's own saved-search form calls free text "Search terms" and stores it as one `quicksearch`
+ * condition with the `contains` operator, so name plus query covers the common case. Multi-clause
+ * searches wait until something asks for them, which keeps the flag surface small.
+ *
+ * @param {string} query Free text to match.
+ * @returns {object[]} One condition in the shape `/searches` accepts.
+ */
+export function searchConditions(query) {
+  return [{ condition: 'quicksearch', operator: 'contains', value: query }]
+}
+
+/**
+ * Whether a saved search holds the conditions asked for.
+ *
+ * Zotero expands one `quicksearch` condition into its field/tag/note/… clauses when it stores a
+ * search, so an exact comparison would call a successful create unconfirmed. A quicksearch is
+ * satisfied when every clause that carries a value carries the searched term.
+ *
+ * @param {object[]} expected The conditions that were sent.
+ * @param {object[]} actual The conditions the library reads back.
+ * @returns {boolean} True when the search means the same thing.
+ */
+export function sameConditions(expected, actual) {
+  if (JSON.stringify(expected) === JSON.stringify(actual)) return true
+  if (expected.length !== 1 || expected[0].condition !== 'quicksearch') return false
+  const meaningful = actual.filter((condition) => condition.value !== undefined && condition.value !== '')
+  return meaningful.length > 0 && meaningful.every((condition) => condition.value === expected[0].value)
+}
+
+/**
+ * A saved search flattened from either a row of `/searches` or a single `/searches/<key>`.
+ *
+ * @param {object} [row] The API row, whose fields may sit at the top level or under `data`.
+ * @returns {{key: string, version: number, name: string, conditions: object[]}} The search.
+ */
+export function normalizeSearch(row = {}) {
+  const data = row.data ?? row
+  return {
+    key: row.key ?? data.key ?? '',
+    version: row.version ?? data.version ?? 0,
+    name: data.name ?? '',
+    conditions: Array.isArray(data.conditions) ? data.conditions : [],
+  }
+}
+
+/** One line that says what a saved search matches, for plans and read-backs. */
+export function describeConditions(conditions) {
+  const parts = conditions.map((each) => `${each.condition} ${each.operator} "${each.value}"`)
+  return parts.join(' · ') || 'no conditions'
+}
+
+async function allSearches() {
+  return (await getJson('/api/users/0/searches?format=json&limit=100')).map(normalizeSearch)
+}
+
+async function readSearch(key) {
+  return normalizeSearch(await getJson(`/api/users/0/searches/${key}?format=json`))
+}
+
 const USAGE =
   'usage: node tools/zotero-collection.mjs --list\n' +
   '       node tools/zotero-collection.mjs --show <key>\n' +
   '       node tools/zotero-collection.mjs --create "<name>" [--parent <key>] [--write]\n' +
   '       node tools/zotero-collection.mjs --rename <key> --name "<new name>" [--write]\n' +
-  '       node tools/zotero-collection.mjs --assign <itemKey> --collection <key> [--remove] [--write]'
+  '       node tools/zotero-collection.mjs --delete <key> [--write]\n' +
+  '       node tools/zotero-collection.mjs --assign <itemKey> --collection <key> [--remove] [--write]\n' +
+  '       node tools/zotero-collection.mjs --saved-search-create "<name>" --query "<terms>" [--write]\n' +
+  '       node tools/zotero-collection.mjs --saved-search-update <key> [--name "<new name>"] [--query "<terms>"] [--write]\n' +
+  '       node tools/zotero-collection.mjs --saved-search-delete <key> [--write]'
 
 function parseArgs(argv) {
-  const options = { mode: '', value: '', name: '', parent: '', item: '', remove: false, write: false }
+  const options = { mode: '', value: '', name: '', parent: '', item: '', query: '', remove: false, write: false }
   const take = (flag, next, field) => {
     if (!next) throw new UsageError(`${flag} needs a value`)
     options[field] = next
@@ -111,13 +181,18 @@ function parseArgs(argv) {
     const next = argv[index + 1]
     switch (flag) {
       case '--list':
+        if (options.mode) throw new UsageError('pass one of --list/--show/--create/--rename/--delete/--assign/--saved-search-*')
         options.mode = 'list'
         break
       case '--create':
       case '--rename':
       case '--show':
+      case '--delete':
       case '--assign':
-        if (options.mode) throw new UsageError('pass one of --list/--show/--create/--rename/--assign')
+      case '--saved-search-create':
+      case '--saved-search-update':
+      case '--saved-search-delete':
+        if (options.mode) throw new UsageError('pass one of --list/--show/--create/--rename/--delete/--assign/--saved-search-*')
         options.mode = flag.slice(2)
         take(flag, next, flag === '--assign' ? 'item' : 'value')
         index += 1
@@ -134,6 +209,10 @@ function parseArgs(argv) {
         take(flag, next, 'value')
         index += 1
         break
+      case '--query':
+        take(flag, next, 'query')
+        index += 1
+        break
       case '--remove':
         options.remove = true
         break
@@ -144,9 +223,13 @@ function parseArgs(argv) {
         throw new UsageError(`unrecognised argument '${flag}'`)
     }
   }
-  if (!options.mode) throw new UsageError('pass --list, --create, --rename or --assign')
+  if (!options.mode) throw new UsageError('pass --list, --show, --create, --rename, --delete, --assign or --saved-search-*')
   if (options.mode === 'rename' && !options.name) throw new UsageError('--rename needs --name "<new name>"')
   if (options.mode === 'assign' && !options.value) throw new UsageError('--assign needs --collection <key>')
+  if (options.mode === 'saved-search-create' && !options.query) throw new UsageError('--saved-search-create needs --query "<terms>"')
+  if (options.mode === 'saved-search-update' && !options.name && !options.query) {
+    throw new UsageError('--saved-search-update needs --name and/or --query')
+  }
   return options
 }
 
@@ -399,9 +482,265 @@ async function runAssign(options) {
   console.log(`\nOK - ${options.item} now files under ${after.join(' · ') || 'none'} (version ${result.after.version}).`)
 }
 
+// A collection is deleted by key, with the version guard the library keeps for it. Zotero deletes the
+// collection's children with it and leaves every item in the library; saying both before the write is
+// the whole point of the plan line, because "delete" here never means "delete the papers".
+async function runDelete(options) {
+  const before = await readCollection(options.value).catch(() => null)
+  if (!before) {
+    throw new Refusal(`no collection ${options.value} in this library.`, {
+      fix: 'Run --list for the keys it does have.',
+    })
+  }
+  const rows = await allCollections()
+  const children = rows.filter((row) => normalizeCollections(row.data?.parentCollection)[0] === options.value)
+  console.log(`collection : ${options.value}  "${before.name}"  under ${before.parentCollection || '(root)'}`)
+  console.log(`version    : ${before.version}`)
+  console.log(`children   : ${children.length}  deleted with it`)
+  console.log(`items      : stay in the library - deleting a collection never deletes an item`)
+  console.log(`write      : DELETE /api/users/0/collections/${options.value}  If-Unmodified-Since-Version: ${before.version}`)
+  if (!options.write) {
+    console.log('\nDRY RUN - nothing was written. Re-run with --write; the reference manager will then')
+    console.log('ask you to Allow the write, and is asked once.')
+    return
+  }
+  const gate = createWriteGate({ appName: APP_NAME })
+  await gate.open()
+  writeAttempted = true
+  const res = await gate.write('DELETE', `/api/users/0/collections/${options.value}`, undefined, {
+    'If-Unmodified-Since-Version': before.version,
+  })
+  if (res.status === 412) {
+    const now = await readCollection(options.value).catch(() => null)
+    console.error(`\nCONFLICT: collection ${options.value} changed since this plan was read. Nothing was written.`)
+    console.error(`It now reads "${now?.name ?? '(gone)'}" at version ${now?.version ?? '?'}.`)
+    process.exitCode = 1
+    return
+  }
+  const goneResult = await readCollection(options.value).then(
+    (value) => ({ ok: true, value }),
+    (error) => ({ ok: false, error }),
+  )
+  const gone = goneResult.ok ? goneResult.value : null
+  const goneForCertain = !goneResult.ok && goneResult.error?.status === 404
+  if (res.status >= 200 && res.status < 300) {
+    if (!goneForCertain) {
+      process.exitCode = reportUnconfirmed({
+        key: options.value,
+        what: gone
+          ? `the delete answered HTTP ${res.status} and the collection still reads "${gone.name}"`
+          : `the delete answered HTTP ${res.status} but the re-read failed (${goneResult.error?.message})`,
+        found: 'Read the tree before trying again.',
+      })
+      return
+    }
+    console.log(`\nOK - ${options.value} is gone; ${children.length} child collection(s) went with it and its items stay in the library.`)
+    return
+  }
+  if (mayHaveLanded(res.status)) {
+    process.exitCode = reportUnconfirmed({
+      key: options.value,
+      what: `the delete answered HTTP ${res.status} (${res.text.slice(0, 200)})`,
+      found: gone ? `A re-read still lists "${gone.name}".` : 'A re-read no longer lists it: the delete landed.',
+    })
+    return
+  }
+  console.error(`\nThe library refused the delete (HTTP ${res.status}): ${res.text.slice(0, 300)}`)
+  process.exitCode = 1
+}
+
+async function runSavedSearchCreate(options) {
+  const body = { name: options.value, conditions: searchConditions(options.query) }
+  console.log(`search     : "${body.name}"`)
+  console.log(`conditions : ${describeConditions(body.conditions)}`)
+  console.log(`body       : ${JSON.stringify([body])}`)
+  console.log('write      : POST /api/users/0/searches')
+  if (!options.write) {
+    console.log('\nDRY RUN - nothing was written. Re-run with --write; the reference manager will then')
+    console.log('ask you to Allow the write, and is asked once.')
+    return
+  }
+  const gate = createWriteGate({ appName: APP_NAME })
+  await gate.open()
+  writeAttempted = true
+  const res = await gate.write('POST', '/api/users/0/searches', [body])
+  if (res.status >= 200 && res.status < 300) {
+    const parsed = JSON.parse(res.text || '{}')
+    const picked = parsed?.successful?.['0'] ?? parsed?.success?.['0']
+    const created = typeof picked === 'string' ? picked : picked?.key
+    if (created) {
+      const back = await readSearch(created)
+      if (back.name === body.name && sameConditions(body.conditions, back.conditions)) {
+        console.log(`\nOK - saved search ${created} "${back.name}" reads back with ${describeConditions(back.conditions)}.`)
+        return
+      }
+      process.exitCode = reportUnconfirmed({
+        key: created,
+        what: 'the saved search was created and does not read back as sent',
+        found: `It reads "${back.name}" with ${describeConditions(back.conditions)}.`,
+      })
+      return
+    }
+    const again = (await allSearches()).find((each) => each.name === body.name)
+    process.exitCode = reportUnconfirmed({
+      key: again?.key ?? '',
+      what: 'the creation answered success without a key',
+      found: again
+        ? `The search list now has "${body.name}" as ${again.key}: the search exists.`
+        : 'The search list does not show it, but the request was sent - do not create it twice.',
+    })
+    return
+  }
+  if (mayHaveLanded(res.status)) {
+    process.exitCode = reportUnconfirmed({
+      key: '',
+      what: `the saved-search creation answered HTTP ${res.status}`,
+      found: 'Read the saved searches with -read --saved-searches before creating it again.',
+    })
+    return
+  }
+  console.error(`\nThe library refused the creation (HTTP ${res.status}): ${res.text.slice(0, 300)}`)
+  process.exitCode = 1
+}
+
+async function runSavedSearchUpdate(options) {
+  const before = await readSearch(options.value).catch(() => null)
+  if (!before) {
+    throw new Refusal(`no saved search ${options.value} in this library.`, {
+      fix: 'List them with -read --saved-searches.',
+    })
+  }
+  const body = {}
+  if (options.name) body.name = options.name
+  if (options.query) body.conditions = searchConditions(options.query)
+  const changed =
+    (body.name !== undefined && body.name !== before.name) ||
+    (body.conditions !== undefined && !sameConditions(body.conditions, before.conditions))
+  console.log(`search     : ${options.value}  "${before.name}"  (version ${before.version})`)
+  console.log(`conditions : ${describeConditions(before.conditions)}`)
+  if (body.name !== undefined) console.log(`name       : "${before.name}" -> "${body.name}"`)
+  if (body.conditions !== undefined) console.log(`conditions : -> ${describeConditions(body.conditions)}`)
+  console.log(`body       : ${JSON.stringify(body)}`)
+  console.log(`write      : PATCH /api/users/0/searches/${options.value}  If-Unmodified-Since-Version: ${before.version}`)
+  if (!changed) {
+    console.log('\nNo change: the saved search already reads that way.')
+    return
+  }
+  if (!options.write) {
+    console.log('\nDRY RUN - nothing was written. Re-run with --write to attempt it.')
+    return
+  }
+  const gate = createWriteGate({ appName: APP_NAME })
+  await gate.open()
+  writeAttempted = true
+  const res = await gate.write('PATCH', `/api/users/0/searches/${options.value}`, body, {
+    'If-Unmodified-Since-Version': before.version,
+  })
+  if (res.status === 412) {
+    console.error(`\nCONFLICT: saved search ${options.value} changed since this plan was read. Nothing was written.`)
+    process.exitCode = 1
+    return
+  }
+  if (res.status >= 200 && res.status < 300) {
+    const back = await readSearch(options.value)
+    const sameName = body.name === undefined || back.name === body.name
+    const conditionsMatch = body.conditions === undefined || sameConditions(body.conditions, back.conditions)
+    if (sameName && conditionsMatch) {
+      console.log(`\nOK - saved search ${options.value} now reads "${back.name}" with ${describeConditions(back.conditions)}.`)
+      return
+    }
+    process.exitCode = reportUnconfirmed({
+      key: options.value,
+      what: 'the library accepted the update and the saved search does not read back as sent',
+      found: `It reads "${back.name}" with ${describeConditions(back.conditions)}.`,
+    })
+    return
+  }
+  if (mayHaveLanded(res.status)) {
+    const back = await readSearch(options.value).catch(() => null)
+    process.exitCode = reportUnconfirmed({
+      key: options.value,
+      what: `the update answered HTTP ${res.status} (${res.text.slice(0, 200)})`,
+      found: back
+        ? `A re-read shows "${back.name}" with ${describeConditions(back.conditions)}.`
+        : 'The re-read that would settle it failed as well.',
+    })
+    return
+  }
+  console.error(`\nThe library refused the update (HTTP ${res.status}): ${res.text.slice(0, 300)}`)
+  process.exitCode = 1
+}
+
+async function runSavedSearchDelete(options) {
+  const before = await readSearch(options.value).catch(() => null)
+  if (!before) {
+    throw new Refusal(`no saved search ${options.value} in this library.`, {
+      fix: 'List them with -read --saved-searches.',
+    })
+  }
+  console.log(`search     : ${options.value}  "${before.name}"  (version ${before.version})`)
+  console.log(`conditions : ${describeConditions(before.conditions)}`)
+  console.log(`write      : DELETE /api/users/0/searches/${options.value}  If-Unmodified-Since-Version: ${before.version}`)
+  if (!options.write) {
+    console.log('\nDRY RUN - nothing was written. Re-run with --write to attempt it.')
+    return
+  }
+  const gate = createWriteGate({ appName: APP_NAME })
+  await gate.open()
+  writeAttempted = true
+  const res = await gate.write('DELETE', `/api/users/0/searches/${options.value}`, undefined, {
+    'If-Unmodified-Since-Version': before.version,
+  })
+  if (res.status === 412) {
+    console.error(`\nCONFLICT: saved search ${options.value} changed since this plan was read. Nothing was written.`)
+    process.exitCode = 1
+    return
+  }
+  const goneResult = await readSearch(options.value).then(
+    (value) => ({ ok: true, value }),
+    (error) => ({ ok: false, error }),
+  )
+  const gone = goneResult.ok ? goneResult.value : null
+  const goneForCertain = !goneResult.ok && goneResult.error?.status === 404
+  if (res.status >= 200 && res.status < 300) {
+    if (!goneForCertain) {
+      process.exitCode = reportUnconfirmed({
+        key: options.value,
+        what: gone
+          ? `the delete answered HTTP ${res.status} and the saved search still reads "${gone.name}"`
+          : `the delete answered HTTP ${res.status} but the re-read failed (${goneResult.error?.message})`,
+        found: 'Read the saved searches before trying again.',
+      })
+      return
+    }
+    console.log(`\nOK - saved search ${options.value} is gone.`)
+    return
+  }
+  if (mayHaveLanded(res.status)) {
+    process.exitCode = reportUnconfirmed({
+      key: options.value,
+      what: `the delete answered HTTP ${res.status} (${res.text.slice(0, 200)})`,
+      found: gone ? `A re-read still lists "${gone.name}".` : 'A re-read no longer lists it: the delete landed.',
+    })
+    return
+  }
+  console.error(`\nThe library refused the delete (HTTP ${res.status}): ${res.text.slice(0, 300)}`)
+  process.exitCode = 1
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2))
-  const runners = { list: runList, show: runShow, create: runCreate, rename: runRename, assign: runAssign }
+  const runners = {
+    list: runList,
+    show: runShow,
+    create: runCreate,
+    rename: runRename,
+    delete: runDelete,
+    assign: runAssign,
+    'saved-search-create': runSavedSearchCreate,
+    'saved-search-update': runSavedSearchUpdate,
+    'saved-search-delete': runSavedSearchDelete,
+  }
   await runners[options.mode](options)
 }
 

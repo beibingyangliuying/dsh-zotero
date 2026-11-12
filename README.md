@@ -16,7 +16,7 @@
 
 模型怎么知道它存在：一行 `description` 常驻在工具表里。不调用它的请求不为那十五个程序付费。
 
-> 与 npm 上的 `dsh-zotero` 无关：那个是另一套实现（16 个常驻工具 + Sources 面板），本包是
+> 与 npm 上的 `dsh-zotero` 无关：那个是另一套实现（30 个常驻工具 + Sources 面板），本包是
 > `@beibingyangliuying/dsh-zotero`，两者可以并存。
 
 ## 两种使用方式
@@ -42,13 +42,13 @@ dsh plugin --profile web add github:beibingyangliuying/dsh-zotero#v0.2.0
 
 | 文件 | 用途 |
 |---|---|
-| `zotero-read.mjs` | 检索、读条目、全文切片、合集与标签 |
-| `zotero-write.mjs` | 新增条目（DOI / arXiv），默认 dry run |
-| `zotero-edit.mjs` | 字段与标签编辑 |
+| `zotero-read.mjs` | 检索、读条目、批量读、参考文献对账、全文切片、合集与标签 |
+| `zotero-write.mjs` | 新增条目（DOI / arXiv / 手工字段 / 笔记），默认 dry run |
+| `zotero-edit.mjs` | 字段与标签编辑（可批量）、回收站恢复、改笔记、删库级标签 |
 | `zotero-remark.mjs` | 只换 remark 那一行，必须背出旧值 |
 | `zotero-section-note.mjs` | 分节笔记（最大的一块） |
-| `zotero-collection.mjs` | 合集管理 |
-| `zotero-export.mjs` | 引用格式化与导出 |
+| `zotero-collection.mjs` | 合集增删改与归档、保存搜索管理 |
+| `zotero-export.mjs` | 引用格式化与导出（含 CSV、`--output` 落盘） |
 | `zotero-pdf.mjs` | PDF 大纲、抽取与渲染 |
 | `zotero-link-attachments.mjs` | 存储附件转链接附件 |
 | `zotero-ensure.mjs` | 启动 / 探测本地 Zotero |

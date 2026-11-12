@@ -11,12 +11,13 @@
 // The reference manager must be running with its local API enabled. Reads need no authorization.
 //
 // Usage:
-//   node tools/zotero-export.mjs --item <key> [--item <key> ...] --format bibtex
+//   node tools/zotero-export.mjs --item <key>[,<key> ...] [--item <key> ...] --format bibtex
 //   node tools/zotero-export.mjs --collection <key> --format bibliography [--style apa] [--locale en-US]
 //   node tools/zotero-export.mjs --item <key> --format citation
-//   formats: citation | bibliography | bibtex | biblatex | ris | csljson
-//   [--library user:0|group:<id>] [--json]
+//   formats: citation | bibliography | bibtex | biblatex | ris | csljson | csv
+//   [--library user:0|group:<id>] [--json] [--output <path>]
 // Exit codes: 0 exported | 1 the library refused, or there is nothing to export | 2 usage.
+import { writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
@@ -29,7 +30,7 @@ import {
 } from './zotero-local-api.mjs'
 import { Refusal, UsageError, reportFailure, reportHelp, wantsHelp } from './refusal.mjs'
 
-const FORMATS = ['citation', 'bibliography', 'bibtex', 'biblatex', 'ris', 'csljson']
+const FORMATS = ['citation', 'bibliography', 'bibtex', 'biblatex', 'ris', 'csljson', 'csv']
 const DEFAULT_STYLE = 'apa'
 const DEFAULT_LOCALE = 'en-US'
 /** Zotero's own itemKey batched-read cap; a larger set is a second invocation, not a silent split. */
@@ -38,10 +39,11 @@ const COLLECTION_PAGE = 100
 const COLLECTION_CAP = 500
 
 const USAGE =
-  'usage: node tools/zotero-export.mjs --item <key> [--item <key> ...] --format <format>\n' +
+  'usage: node tools/zotero-export.mjs --item <key>[,<key> ...] [--item <key> ...] --format <format>\n' +
   '       node tools/zotero-export.mjs --collection <key> --format <format> [--limit N]\n' +
   `       formats: ${FORMATS.join(' | ')}\n` +
   '       [--style <csl-style>] [--locale <csl-locale>] [--library user:0|group:<id>] [--json]\n' +
+  '       [--output <path>]\n' +
   '       --limit applies to a collection export (default 50, at most 100).'
 
 /**
@@ -62,6 +64,7 @@ export function parseArgs(argv) {
     libraryRaw: '',
     library: PERSONAL_LIBRARY,
     json: false,
+    output: '',
   }
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index]
@@ -69,7 +72,7 @@ export function parseArgs(argv) {
     switch (flag) {
       case '--item':
         if (!next) throw new UsageError('--item needs a record key')
-        options.items.push(next)
+        options.items.push(...next.split(',').map((key) => key.trim()).filter(Boolean))
         index += 1
         break
       case '--collection':
@@ -108,6 +111,11 @@ export function parseArgs(argv) {
         break
       case '--json':
         options.json = true
+        break
+      case '--output':
+        if (!next) throw new UsageError('--output needs a file path')
+        options.output = next
+        index += 1
         break
       default:
         throw new UsageError(`unrecognised argument '${flag}'`)
@@ -231,6 +239,135 @@ async function collectionKeys(options) {
 }
 
 /**
+ * The columns a CSV export carries, in order.
+ *
+ * These are the fields a reference-row spreadsheet is read for: identity, the citation as the
+ * library holds it, and the abstract and tags for filtering. Citation keys are included because
+ * 1.0.1 made them a first-class field and a spreadsheet is where a missing one is spotted.
+ */
+export const CSV_COLUMNS = [
+  'key',
+  'itemType',
+  'title',
+  'creators',
+  'date',
+  'publicationTitle',
+  'volume',
+  'issue',
+  'pages',
+  'DOI',
+  'ISBN',
+  'url',
+  'citationKey',
+  'abstractNote',
+  'tags',
+]
+
+/**
+ * One CSV cell, quoted only when it has to be.
+ *
+ * RFC 4180 quoting: a comma, a quote or a line break forces quotes, and an embedded quote doubles.
+ * Leading and trailing spaces are quoted too, because a spreadsheet trims them on read otherwise.
+ *
+ * @param {unknown} value The cell value.
+ * @returns {string} The cell as it goes into the row.
+ */
+export function csvCell(value) {
+  const text = value === undefined || value === null ? '' : String(value)
+  if (!/[",\r\n]/.test(text) && text.trim() === text) return text
+  return `"${text.replaceAll('"', '""')}"`
+}
+
+/** The creators of a record as one semicolon-joined cell, "First Last" per creator. */
+export function creatorsText(creators) {
+  return (Array.isArray(creators) ? creators : [])
+    .map((creator) => `${creator.firstName ?? ''} ${creator.lastName ?? ''}`.trim() || (creator.name ?? ''))
+    .filter((name) => name !== '')
+    .join('; ')
+}
+
+/** The tags of a record as one semicolon-joined cell. */
+export function tagsText(tags) {
+  return (Array.isArray(tags) ? tags : []).map((tag) => tag.tag ?? '').filter((tag) => tag !== '').join('; ')
+}
+
+/**
+ * One record as a CSV row, in CSV_COLUMNS order.
+ *
+ * @param {object} item A row from `/items` (fields either at the top level or under `data`).
+ * @returns {string[]} The cells, unquoted.
+ */
+export function itemToCsvRow(item = {}) {
+  const data = item.data ?? item
+  return [
+    item.key ?? data.key ?? '',
+    data.itemType ?? '',
+    data.title ?? '',
+    creatorsText(data.creators),
+    data.date ?? '',
+    data.publicationTitle ?? '',
+    data.volume ?? '',
+    data.issue ?? '',
+    data.pages ?? '',
+    data.DOI ?? '',
+    data.ISBN ?? '',
+    data.url ?? '',
+    data.citationKey ?? '',
+    data.abstractNote ?? '',
+    tagsText(data.tags),
+  ]
+}
+
+/**
+ * A whole CSV document, header included and newline-terminated.
+ *
+ * @param {object[]} items The records, in the caller's order.
+ * @returns {string} The document.
+ */
+export function buildCsv(items) {
+  const lines = [CSV_COLUMNS.map(csvCell).join(',')]
+  for (const item of items) lines.push(itemToCsvRow(item).map(csvCell).join(','))
+  return `${lines.join('\n')}\n`
+}
+
+/** Print an export, or write it to --output and say where it went. */
+function emitText(text, options) {
+  const body = text.endsWith('\n') ? text : `${text}\n`
+  if (!options.output) {
+    process.stdout.write(body)
+    return
+  }
+  try {
+    writeFileSync(options.output, body, 'utf8')
+  } catch (error) {
+    throw new Refusal(`cannot write ${options.output}: ${error.message}`, {
+      fix: 'pass --output a path whose directory exists and is writable',
+    })
+  }
+  console.log(`wrote ${options.output} (${Buffer.byteLength(body, 'utf8')} bytes)`)
+}
+
+/** One record per key, in the caller's order, for formats that need fields rather than a translator. */
+async function requestItems(keys, options) {
+  const path = `${libraryPrefix(options.library)}/items?itemKey=${keys.join(',')}&format=json`
+  const res = await localRequest('GET', path)
+  if (res.status !== 200) {
+    throw new Refusal(`the record listing answered HTTP ${res.status}: ${res.text.slice(0, 200)}`, {
+      fix: 'read the keys again with zotero-read --item and check that the library still holds them',
+    })
+  }
+  const rows = JSON.parse(res.text)
+  const byKey = new Map(rows.map((row) => [row.key ?? row.data?.key, row]))
+  const missing = keys.filter((key) => !byKey.has(key))
+  if (missing.length > 0) {
+    throw new Refusal(`the library returned no record for ${missing.join(', ')}`, {
+      fix: 'read each key with zotero-read --item; a key copied from a search result is not always the record key',
+    })
+  }
+  return keys.map((key) => byKey.get(key))
+}
+
+/**
  * Export, print, and return the exit code.
  *
  * @param {object} options Parsed options.
@@ -254,6 +391,29 @@ async function runExport(options) {
     )
   }
 
+  if (options.format === 'csv') {
+    const items = await requestItems(keys, options)
+    const csv = buildCsv(items)
+    if (options.json) {
+      emitText(
+        JSON.stringify(
+          {
+            format: options.format,
+            library: options.library,
+            items: items.map((row) => ({ key: row.key ?? row.data?.key, ref: itemRef(row.key ?? row.data?.key, options.library) })),
+            csv,
+          },
+          null,
+          2,
+        ),
+        options,
+      )
+      return 0
+    }
+    emitText(csv, options)
+    return 0
+  }
+
   const body = await requestExport(buildExportPath(keys, options))
   if (options.format === 'citation') {
     const rows = JSON.parse(body)
@@ -265,7 +425,7 @@ async function runExport(options) {
       })
     }
     if (options.json) {
-      console.log(
+      emitText(
         JSON.stringify(
           {
             format: options.format,
@@ -277,16 +437,20 @@ async function runExport(options) {
           null,
           2,
         ),
+        options,
       )
       return 0
     }
-    console.log(`format : ${options.format} · style ${options.style} · locale ${options.locale} · ${citations.length} record(s)`)
-    citations.forEach((entry, index) => console.log(`${index + 1}. ${entry.key}\n   ${entry.citation}`))
+    const lines = [
+      `format : ${options.format} · style ${options.style} · locale ${options.locale} · ${citations.length} record(s)`,
+      ...citations.map((entry, index) => `${index + 1}. ${entry.key}\n   ${entry.citation}`),
+    ]
+    emitText(lines.join('\n'), options)
     return 0
   }
 
   if (options.json) {
-    console.log(
+    emitText(
       JSON.stringify(
         {
           format: options.format,
@@ -299,10 +463,11 @@ async function runExport(options) {
         null,
         2,
       ),
+      options,
     )
     return 0
   }
-  console.log(body)
+  emitText(body, options)
   return 0
 }
 

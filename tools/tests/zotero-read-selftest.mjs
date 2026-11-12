@@ -25,15 +25,22 @@ import {
   groupHits,
   itemForJson,
   noteHeadings,
+  normalizeTitle,
   parseArgs,
+  parseBibtex,
+  parseItemKeys,
+  parseReferenceJson,
   pickAttachment,
   rankPassages,
   readItemOrRefuse,
+  referenceDiff,
+  referenceFromEntry,
   sameDoi,
   screenRows,
   selectRequested,
   shortCreators,
   sliceText,
+  titleMatches,
   tokenize,
   yearOf,
 } from '../zotero-read.mjs'
@@ -530,6 +537,75 @@ check(noteChild.note === '<p>a body</p>', 'the input is not mutated')
 const pdfChild = { key: 'ATT00001', version: 9, itemType: 'attachment', contentType: 'application/pdf' }
 check(itemForJson(pdfChild).noteCharacters === undefined, 'a child with no body gains no length')
 check(JSON.stringify(itemForJson({})) === '{}', 'an empty child stays empty')
+
+// --- a reference file answered against the library ------------------------------------------------
+
+console.log('\n[18] a BibTeX entry is read without a dependency, braces and all')
+
+const BIBTEX = `@comment{this is ignored}
+@article{smith2020,
+  title = {A {Nested} Title with an escaped \\{ brace},
+  author = {Smith, Jane and Doe, John and others},
+  year = {2020},
+  doi = {https://doi.org/10.1000/ABC},
+  journal = "Journal of Tests"
+}
+@book{lee2021,
+  title = "A Quoted Book Title",
+  editor = {Lee, Ann},
+  date = {2021-04-02}
+}`
+
+const parsedBibtex = parseBibtex(BIBTEX)
+check(parsedBibtex.problems.length === 0, 'well-formed entries raise no problem', String(parsedBibtex.problems.length))
+check(parsedBibtex.entries.length === 2, '@comment is skipped', String(parsedBibtex.entries.length))
+check(parsedBibtex.entries[0].id === 'smith2020', 'the citation key is kept')
+check(parsedBibtex.entries[0].fields.title === 'A Nested Title with an escaped \\ brace', 'nested braces are stripped and an escaped brace is kept as text', parsedBibtex.entries[0].fields.title)
+check(parsedBibtex.entries[1].fields.title === 'A Quoted Book Title', 'a quoted value is unquoted')
+
+const smith = referenceFromEntry(parsedBibtex.entries[0])
+check(smith.doi === '10.1000/abc', 'the DOI is normalized', smith.doi)
+check(smith.year === '2020', 'the year is read', smith.year)
+check(smith.authors.join('|') === 'Smith|Doe', 'surnames are read and "others" is dropped', smith.authors.join('|'))
+check(referenceFromEntry(parsedBibtex.entries[1]).authors[0] === 'Lee', 'an editor stands in for a missing author')
+check(parseBibtex('@article{x, title = {unterminated').problems.length === 1, 'an unterminated entry is reported, not silently dropped')
+check(parseBibtex('').entries.length === 0, 'an empty file has no entries')
+
+console.log('\n[19] a held record is matched by DOI or normalized title, and its differences are named')
+
+check(normalizeTitle('Attention Is All You Need.') === normalizeTitle('attention is all you need'), 'case and punctuation do not separate a title')
+check(normalizeTitle('Café Society') === normalizeTitle('Cafe Society'), 'an accent does not separate a title')
+check(normalizeTitle('<i>Marked</i> up') === normalizeTitle('Marked up'), 'markup does not separate a title')
+check(normalizeTitle(undefined) === '', 'a missing title normalizes to nothing')
+
+const held = { key: 'ABCD2345', data: { itemType: 'journalArticle', title: 'Attention is all you need', date: '2017-06-12', DOI: '10.1000/abc', creators: [{ creatorType: 'author', lastName: 'Vaswani' }, { creatorType: 'author', lastName: 'Shazeer' }] } }
+const differentRecord = { key: 'BCDE3456', data: { itemType: 'journalArticle', title: 'A different paper', date: '2018' } }
+const heldReference = { id: 'vaswani2017', doi: 'https://doi.org/10.1000/ABC', title: 'Attention Is All You Need', year: '2019', authors: ['Vaswani', 'Shazeer', 'Parmar'] }
+
+const diffs = referenceDiff(heldReference, held.data)
+check(diffs.some((diff) => diff.field === 'year' && diff.reference === '2019' && diff.library === '2017'), 'a differing year is named with both values')
+check(diffs.some((diff) => diff.field === 'authors'), 'a differing author list is named')
+check(!diffs.some((diff) => diff.field === 'title'), 'a title that normalizes equal is not a difference')
+check(!diffs.some((diff) => diff.field === 'DOI'), 'an equal DOI is not a difference')
+
+check(titleMatches(heldReference, [held, differentRecord]).length === 1, 'the exact title finds one record')
+check(titleMatches({ ...heldReference, doi: '', title: 'Attention is all' }, [held, differentRecord]).length === 0, 'a short prefix is not treated as a match')
+check(titleMatches({ ...heldReference, title: 'Attention is all you need and more' }, [held]).length === 1, 'a long prefix of a held title is a candidate')
+
+const jsonRefs = parseReferenceJson(JSON.stringify([{ citationKey: 'a', DOI: '10.1/x', title: 'One' }, { title: '' }, 'not an object']))
+check(jsonRefs.references.length === 1, 'a row with no title and no DOI is not a reference', String(jsonRefs.references.length))
+check(jsonRefs.problems.length === 2, 'each unusable row is reported', String(jsonRefs.problems.length))
+check(jsonRefs.references[0].id === 'a' && jsonRefs.references[0].doi === '10.1/x', 'the citation key and DOI are kept')
+check(parseReferenceJson('{"references":[{"title":"Solo"}]}').references.length === 1, 'the {references:[...]} envelope is accepted')
+
+check(parseArgs(['--items', 'ABCD2345,BCDE3456']).keys.length === 2, '--items reads a comma list')
+throws('--items refuses a malformed key', () => parseItemKeys('ABCD2345,nope'))
+throws('--items refuses an empty list', () => parseItemKeys(','))
+throws('--items refuses more than fifty keys', () => parseItemKeys(Array.from({ length: 51 }, (_, i) => String(i).padStart(8, '0')).join(',')))
+throws('--match does not accept an unknown format', () => parseArgs(['--match', 'refs.bib', '--format', 'yaml']))
+throws('--format is not accepted outside --match', () => parseArgs(['--search', 'x', '--format', 'json']))
+check(parseArgs(['--match', 'refs.json']).format === 'json', 'a .json path defaults to the JSON reader')
+check(parseArgs(['--match', '-']).format === 'bibtex', 'stdin defaults to BibTeX')
 
 console.log(`\n${failures === 0 ? 'PASS' : `FAIL (${failures})`}`)
 process.exit(failures === 0 ? 0 : 1)
