@@ -118,6 +118,9 @@ const REFERENCE_FORMATS = ['bibtex', 'json']
 const LISTING_SCAN = 400
 /** The file-side reader, named in a `fix` line only as an absolute, runnable path. */
 const PDF_TOOL = fileURLToPath(new URL('./zotero-pdf.mjs', import.meta.url))
+/** The two programs a missing reference is handed to, named the same way. */
+const WRITE_TOOL = fileURLToPath(new URL('./zotero-write.mjs', import.meta.url))
+const METADATA_TOOL = fileURLToPath(new URL('./metadata.mjs', import.meta.url))
 
 /**
  * What one search row IS, and which record it belongs to.
@@ -427,6 +430,10 @@ const USAGE =
   '                                  # which references are already here, and where they differ\n' +
   '       node tools/zotero-read.mjs --collection <key> --screen [--screen-limit N]\n' +
   '       [--library user:0|group:<id>] [--json]\n' +
+  '       --find-doi answers by identifier, and a candidate whose DOI field is EMPTY is listed apart\n' +
+  '       from one that carries a different DOI: neither confirms nor denies the work, so both are shown.\n' +
+  '       --match prints, under each MISSING reference, the command that would fetch and create it - a\n' +
+  '       dry run; add --write to the printed command to create the record.\n' +
   '       --limit counts ROWS for a search (at most 100, the library\'s page size) and CHARACTERS for a\n' +
   '       read (default 12000, at most 100000). A note costs its own length on every read, so --headings\n' +
   '       and then --offset is the cheap way into one section of a long one.\n' +
@@ -1463,6 +1470,35 @@ function loadReferences(options) {
 }
 
 /**
+ * One word as a shell would take it: bare when it is unremarkable, single-quoted otherwise.
+ *
+ * @param {string} text
+ * @returns {string} `text`, quoted if a shell could split or expand it.
+ */
+function shellWord(text) {
+  return /^[A-Za-z0-9._~:@+,/=-]+$/.test(text) ? text : `'${text.replaceAll("'", `'\\''`)}'`
+}
+
+/**
+ * The command that would settle one missing reference, or nothing when this tool cannot name one.
+ *
+ * A MISSING line names what the library did not hold; it used to stop there, leaving the reader to
+ * compose the next call from the usage block. The two programs that answer it are named by absolute
+ * path, so the line can be copied as it stands - and the create command is a DRY RUN unless `--write`
+ * is added, because a reference-list reconciliation must not write by accident.
+ *
+ * @param {{doi?: string, title?: string}} reference One reference from the file.
+ * @param {string} [library] The library `--match` was pointed at.
+ * @returns {string} A runnable command, or `''` when the write tools cannot reach that library.
+ */
+export function referenceCreateCommand(reference, library = PERSONAL_LIBRARY) {
+  if (library !== PERSONAL_LIBRARY) return ''
+  if (reference.doi) return `node "${WRITE_TOOL}" --doi ${shellWord(reference.doi)}`
+  if (reference.title) return `node "${METADATA_TOOL}" --search ${shellWord(reference.title)}`
+  return ''
+}
+
+/**
  * Every reference of one file, answered against the library: held, ambiguous, or missing.
  *
  * A DOI that the library holds is a match even when the record's title is spelled differently; a
@@ -1514,6 +1550,7 @@ async function runMatch(options) {
           year: yearOf(data.date) || '',
           doi: data.DOI ?? '',
         })),
+        next: referenceCreateCommand(reference, options.library),
       })
     }
   }
@@ -1562,6 +1599,13 @@ async function runMatch(options) {
     for (const candidate of entry.nearest) {
       console.log(`   near  : ${candidate.key}  ${candidate.year || '????'}  ${candidate.title}`)
     }
+    if (entry.next) console.log(`   next  : ${entry.next}`)
+  }
+  if (missing.length > 0 && options.library !== PERSONAL_LIBRARY) {
+    console.log(`   note  : --library ${options.library} is not the personal library, and the write tools target the personal one only`)
+  }
+  if (missing.some((entry) => entry.next)) {
+    console.log('next    : the command under MISSING is a dry run that fetches the record; add --write to create it.')
   }
   console.log(
     `summary : ${matched.length} held${withDiffs.length > 0 ? ` (${withDiffs.length} with field differences)` : ''}, ` +
@@ -1954,11 +1998,29 @@ export function sameDoi(value) {
 }
 
 /**
- * The items in this library that carry the DOI asked for.
+ * The candidates a DOI search turned up, split by what their own DOI field says.
  *
  * A DOI search is a text search, so the answer is filtered: a record whose title merely contains the
- * string is not the work with that identifier.
+ * string is not the work with that identifier. But a record whose DOI field is EMPTY is not refuted by
+ * that comparison either - and treating it as refuted is how this mode once answered "not in this
+ * library" about a record that was right there, holding the work under a DOI nobody had filled in yet.
+ *
+ * @param {Array<{key: string, ref: string, title: string, itemType: string, doi: string}>} listed
+ *   The candidates, with their DOI field as the record spells it.
+ * @param {string} target A DOI in {@link sameDoi}'s form.
+ * @returns {{matches: object[], withoutDoi: object[], otherDoi: object[]}} Records carrying the DOI,
+ *   records with no DOI at all, and records carrying a different one.
  */
+export function doiCandidates(listed, target) {
+  const bare = (entry) => sameDoi(entry.doi)
+  return {
+    matches: listed.filter((entry) => bare(entry) !== '' && bare(entry) === target),
+    withoutDoi: listed.filter((entry) => bare(entry) === ''),
+    otherDoi: listed.filter((entry) => bare(entry) !== '' && bare(entry) !== target),
+  }
+}
+
+/** The items in this library that carry the DOI asked for, and the candidates that cannot be settled. */
 async function runFindDoi(options) {
   const target = sameDoi(options.value)
   if (target === '') throw new UsageError('--find-doi needs a DOI')
@@ -1973,26 +2035,47 @@ async function runFindDoi(options) {
   const missing = groups.filter((group) => !group.record).map((group) => group.parentKey)
   const fetched = missing.length > 0 ? await recordsByKey(missing, options.library) : new Map()
   for (const group of groups) if (!group.record && fetched.has(group.parentKey)) group.record = fetched.get(group.parentKey)
-  const matches = groups
-    .filter((group) => sameDoi(group.record?.DOI) === target)
+  const listed = groups
+    .filter((group) => group.record !== undefined && group.record !== null)
     .map((group) => ({
       key: group.parentKey,
       ref: itemRef(group.parentKey, options.library),
       title: group.record?.title ?? '',
       itemType: group.record?.itemType ?? '',
+      doi: String(group.record?.DOI ?? '').trim(),
     }))
+  const { matches, withoutDoi, otherDoi } = doiCandidates(listed, target)
 
   if (options.json) {
-    console.log(JSON.stringify({ doi: target, library: options.library, searched: total, matches }, null, 2))
+    console.log(JSON.stringify({ doi: target, library: options.library, searched: total, matches, withoutDoi, otherDoi }, null, 2))
     return
   }
-  console.log(`doi    : ${target}`)
-  console.log(`matches: ${matches.length} of ${groups.length} candidate(s) from a text search`)
+  console.log(`doi     : ${target}`)
+  console.log(`searched: ${listed.length} of ${total} candidate(s) from a text search`)
+  console.log(
+    `carries : ${matches.length} with that DOI · ${withoutDoi.length} with no DOI field · ${otherDoi.length} with a different DOI`,
+  )
+  for (const match of matches) console.log(`match   : ${match.key}  ${match.ref}  ${match.itemType}  ${match.title}`)
+  if (withoutDoi.length > 0) {
+    console.log('')
+    console.log('no DOI  : the DOI field of these records is empty, so the identifier cannot confirm or deny them:')
+    for (const entry of withoutDoi) console.log(`          ${entry.key}  ${entry.ref}  ${entry.itemType}  ${entry.title}`)
+  }
+  if (otherDoi.length > 0) {
+    console.log('')
+    console.log('other   : these carry a DOI other than the one asked; a typo on either side is the usual cause:')
+    for (const entry of otherDoi) console.log(`          ${entry.key}  ${entry.doi}  ${entry.title}`)
+  }
   if (matches.length === 0) {
-    console.log('\nnot in this library - the search was answered and no record carries that DOI. This is not a failure.')
-    return
+    console.log('')
+    console.log('NOT FOUND by identifier - this is not a failure, and not proof of absence.')
+    console.log(
+      listed.length === 0
+        ? 'The text search found no candidate at all.'
+        : 'The candidates above are what a text search turned up; read one to settle it.',
+    )
   }
-  for (const match of matches) console.log(`${match.key}  ${match.ref}  ${match.itemType}  ${match.title}`)
+  console.log('hint    : --item <key> reads one; --match <file> answers a whole reference list, by DOI or title.')
 }
 
 /** What changed in the library since a version, or the baseline a later call can diff from. */

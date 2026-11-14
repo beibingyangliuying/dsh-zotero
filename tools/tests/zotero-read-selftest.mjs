@@ -20,6 +20,7 @@ import {
   citationLines,
   classifyHit,
   coverageOf,
+  doiCandidates,
   extraLines,
   findPassages,
   groupHits,
@@ -33,6 +34,7 @@ import {
   pickAttachment,
   rankPassages,
   readItemOrRefuse,
+  referenceCreateCommand,
   referenceDiff,
   referenceFromEntry,
   sameDoi,
@@ -479,6 +481,38 @@ check(parseArgs(['--item-fields', 'dataset']).value === 'dataset', '--item-field
 throws('--item-fields needs a type', () => parseArgs(['--item-fields']))
 check(parseArgs(['--saved-searches']).mode === 'saved-searches', '--saved-searches is a mode')
 check(parseArgs(['--find-doi', '10.1038/x']).value === '10.1038/x', '--find-doi takes the DOI')
+
+// A DOI search is a text search, so its answer is filtered. The filter used to keep only equal DOIs,
+// and the record that made this tool say "not in this library" held the work under a DOI nobody had
+// filled in yet - so it was dropped by the very comparison that was supposed to find it.
+const DOI_LISTED = [
+  { key: 'CARRY001', ref: 'ref-carry', title: 'carries it', itemType: 'journalArticle', doi: '10.1016/J.RESS.2023.109755' },
+  { key: 'EMPTY001', ref: 'ref-empty', title: 'no DOI field', itemType: 'journalArticle', doi: '' },
+  { key: 'OTHER001', ref: 'ref-other', title: 'a different DOI', itemType: 'journalArticle', doi: '10.1016/j.ress.2024.109755' },
+]
+const buckets = doiCandidates(DOI_LISTED, '10.1016/j.ress.2023.109755')
+check(buckets.matches.length === 1 && buckets.matches[0].key === 'CARRY001', 'a DOI differing only in case is the same work')
+check(buckets.withoutDoi.length === 1 && buckets.withoutDoi[0].key === 'EMPTY001', 'a candidate whose DOI field is empty is listed apart, not dropped')
+check(buckets.otherDoi.length === 1 && buckets.otherDoi[0].key === 'OTHER001', 'a candidate carrying another DOI is listed apart too')
+check(doiCandidates([], '10.1/x').matches.length === 0, 'no candidates is no match')
+check(doiCandidates([{ key: 'E', doi: '' }], '').matches.length === 0, 'an empty target does not turn an empty field into a match')
+check(doiCandidates([{ key: 'E', doi: '' }], '10.1/x').withoutDoi.length === 1, 'nor is an empty field refuted by an identifier lookup')
+
+const createByDoi = referenceCreateCommand({ doi: '10.1016/j.ress.2023.109755', title: 'A paper' })
+check(
+  createByDoi.startsWith('node "') && createByDoi.includes('zotero-write.mjs') && createByDoi.endsWith('--doi 10.1016/j.ress.2023.109755'),
+  'a missing reference with a DOI names the write tool by absolute path',
+  createByDoi,
+)
+check(!createByDoi.includes('--write'), 'and the printed command is a dry run')
+const createByTitle = referenceCreateCommand({ doi: '', title: 'Seismic resilience of a network' })
+check(
+  createByTitle.includes('metadata.mjs') && createByTitle.endsWith("'Seismic resilience of a network'"),
+  'a missing reference with no DOI is looked up by its title, quoted for a shell',
+  createByTitle,
+)
+check(referenceCreateCommand({ doi: '', title: '' }) === '', 'a reference with neither DOI nor title gets no command')
+check(referenceCreateCommand({ doi: '10.1/x' }, 'group:1') === '', 'a group library gets no create command: the write tools target the personal one')
 
 // --- a note's own headings ----------------------------------------------------------------------
 
