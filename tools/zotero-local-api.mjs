@@ -164,6 +164,26 @@ export async function itemTypes() {
   return getJson('/api/itemTypes')
 }
 
+/**
+ * The creator types one item type accepts, or null when the build cannot say.
+ *
+ * The same reasoning as {@link fieldNamesForType}: a book wants `author`, but `editor` and
+ * `translator` are valid for it too, and a patent does not take every role a film does. Callers that
+ * write creators check the requested roles here, before the write, rather than let the library refuse
+ * a name it was given.
+ *
+ * @param {string} itemType The Zotero item type.
+ * @returns {Promise<string[]|null>} The creator type names, or null when the build answers 404.
+ */
+export async function creatorTypesForType(itemType) {
+  const res = await localRequest('GET', `/api/itemTypeCreatorTypes?itemType=${encodeURIComponent(itemType)}`)
+  if (res.status === 404) return null
+  if (res.status !== 200) throw new Error(`itemTypeCreatorTypes answered ${res.status}: ${res.text.slice(0, 200)}`)
+  const rows = JSON.parse(res.text)
+  if (!Array.isArray(rows)) return null
+  return rows.map((row) => row?.creatorType).filter(Boolean)
+}
+
 /** The saved searches filed in one library. */
 export async function savedSearches(library = PERSONAL_LIBRARY) {
   return getJson(`${libraryPrefix(library)}/searches?format=json&limit=100`)

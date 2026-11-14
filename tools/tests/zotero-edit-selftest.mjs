@@ -7,6 +7,8 @@
 //     "no", because the caller has to know where to go instead;
 //   * the tag list sent is the WHOLE next list, not a delta, because whether a patch's `tags`
 //     replaces or merges is not something this repository has measured;
+//   * the creator list is the WHOLE list too, stated as `type: Last, First` lines and read back in the
+//     same form, because a half-corrected name list is invisible in the library's own view;
 //   * a change that changes nothing is reported as nothing, so no authorization dialog is spent on it.
 //
 // Section [3] spawns the command line against a STUB library, because the exit code is what a caller
@@ -17,7 +19,20 @@ import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { EDITABLE_FIELDS, REFUSED_FIELDS, changedFields, computeTagChange, flattenTrashGraph, invalidFields, isDeleted, parseItemKeys, parseSetFlags, resolveAction } from '../zotero-edit.mjs'
+import {
+  EDITABLE_FIELDS,
+  REFUSED_FIELDS,
+  changedFields,
+  computeTagChange,
+  flattenTrashGraph,
+  formatCreator,
+  invalidFields,
+  isDeleted,
+  parseCreatorList,
+  parseItemKeys,
+  parseSetFlags,
+  resolveAction,
+} from '../zotero-edit.mjs'
 
 let failures = 0
 const check = (condition, label, detail = '') => {
@@ -59,6 +74,30 @@ throws('an assignment with no "=" is refused', () => parseSetFlags(['title']), '
 throws('an unknown field is refused', () => parseSetFlags(['titel=x']), 'takes one of')
 throws('a refused field is refused WITH its reason', () => parseSetFlags(['creators=x']), 'structured')
 throws('changing the item type is refused with its reason', () => parseSetFlags(['itemType=book']), 'decides which fields')
+
+console.log('\n[2b] reading a creator list')
+check(
+  JSON.stringify(parseCreatorList('author:de la Llera, Juan Carlos')) ===
+    '[{"creatorType":"author","lastName":"de la Llera","firstName":"Juan Carlos"}]',
+  'a comma ends the family name, so "de la Llera" stays whole',
+  JSON.stringify(parseCreatorList('author:de la Llera, Juan Carlos')),
+)
+check(
+  JSON.stringify(parseCreatorList('editor:Smith, John; author:Vaswani')) ===
+    '[{"creatorType":"editor","lastName":"Smith","firstName":"John"},{"creatorType":"author","name":"Vaswani"}]',
+  'a line with no comma is a single-field name, and the type defaults to author only when absent',
+  JSON.stringify(parseCreatorList('editor:Smith, John; author:Vaswani')),
+)
+check(parseCreatorList('   ').length === 0 && parseCreatorList('a, b;').length === 1, 'blank lines and a trailing ";" are dropped')
+check(parseCreatorList('World Health Organization')[0].name === 'World Health Organization', 'an institution is not split into a family name')
+throws('a type with no name is a usage error', () => parseCreatorList('author:'), "type: Last, First")
+check(formatCreator({ creatorType: 'author', lastName: 'de la Llera', firstName: 'Juan Carlos' }) === 'author: de la Llera, Juan Carlos', 'formatting names both parts')
+check(formatCreator({ creatorType: 'editor', name: 'World Health Organization' }) === 'editor: World Health Organization', 'a single-field creator formats without a comma')
+check(formatCreator({ lastName: 'Vaswani' }) === 'author: Vaswani', 'a creator with no type is an author')
+check(
+  parseCreatorList('author:de la Llera, Juan Carlos').map(formatCreator).join() === 'author: de la Llera, Juan Carlos',
+  'a parsed line reads back as the line that was typed',
+)
 
 console.log('\n[3] tags are computed as a whole list')
 
@@ -108,6 +147,7 @@ const baseRecord = () => ({
   title: 'A paper',
   DOI: '10.1000/example',
   tags: [{ tag: '/unread' }, { tag: '/keep' }],
+  creators: [{ creatorType: 'author', lastName: 'Carlos de la Llera', firstName: 'Juan' }],
   version: 12,
   collections: [],
 })
@@ -119,6 +159,7 @@ const stub = {
   requests: [],
   authorize: () => ({ status: 200, body: { key: 'stub-key', remember: false } }),
   patchItem: null,
+  creatorTypes: null,
 }
 
 const resetLibrary = () => {
@@ -126,6 +167,7 @@ const resetLibrary = () => {
   stub.requests.length = 0
   stub.authorize = () => ({ status: 200, body: { key: 'stub-key', remember: false } })
   stub.patchItem = null
+  stub.creatorTypes = null
 }
 
 /** The library's own rule in miniature: honour the version precondition, then carry the change out. */
@@ -167,6 +209,13 @@ const server = createServer((req, res) => {
     const answer = stub.authorize()
     if (answer.status !== 200) send(answer.status, { error: 'the stub declined the dialog' })
     else send(200, answer.body)
+    return
+  }
+  // Only the creator types a scenario asks for: a 404 here means "this library does not say", which
+  // the editor treats as "skip the check" rather than as an empty vocabulary.
+  if (path === '/api/itemTypeCreatorTypes') {
+    if (!stub.creatorTypes) send(404, { error: 'not found' })
+    else send(200, stub.creatorTypes.map((creatorType) => ({ creatorType })))
     return
   }
   const itemPath = /^\/api\/users\/0\/items\/([A-Z0-9]+)$/.exec(path)
@@ -291,11 +340,58 @@ check(writes().length === 0, 'and no PATCH reached the library', `${writes().len
 resetLibrary()
 const refusedField = await runAsync(['--item', 'EDIT0001', '--set', 'creators=Someone'])
 check(refusedField.status === 2, 'a refused field is a usage error: exit 2', `status ${refusedField.status}`)
-check(refusedField.stderr.includes('edit it in the application'), 'and it names where to go instead', first(refusedField.stderr))
+check(
+  refusedField.stderr.includes('state the whole list with --set-creators'),
+  'and it names where to go instead',
+  first(refusedField.stderr),
+)
 
 resetLibrary()
-const unknownField = await runAsync(['--item', 'EDIT0001', '--set', 'publisher=Someone'])
+const unknownField = await runAsync(['--item', 'EDIT0001', '--set', 'citationKey=someone'])
 check(unknownField.status === 2, 'a field outside the whitelist is exit 2', `status ${unknownField.status}`)
+
+// --- the creator list, through the command line ---------------------------------------------------
+
+resetLibrary()
+const creatorPlan = await runAsync(['--item', 'EDIT0001', '--set-creators', 'author:de la Llera, Juan Carlos'])
+check(creatorPlan.status === 0, 'a creator plan is a dry run that exits 0', `status ${creatorPlan.status}`)
+check(
+  creatorPlan.stdout.includes('- : author: Carlos de la Llera, Juan'),
+  'the plan shows the name the record holds',
+  first(creatorPlan.stdout),
+)
+check(
+  creatorPlan.stdout.includes('+ : author: de la Llera, Juan Carlos'),
+  'and the name it would hold after',
+  creatorPlan.stdout.split(/\r?\n/).find((line) => line.includes('+ :')) ?? '',
+)
+check(writes().length === 0, 'and nothing reached the library', `${writes().length} write(s)`)
+
+resetLibrary()
+const creatorWrite = await runAsync(['--item', 'EDIT0001', '--set-creators', 'author:de la Llera, Juan Carlos', '--write'])
+check(creatorWrite.status === 0, 'a creator write that reads back is exit 0', `status ${creatorWrite.status}`)
+check(
+  stub.record.creators?.[0]?.lastName === 'de la Llera' && stub.record.creators?.[0]?.firstName === 'Juan Carlos',
+  'the library now holds the corrected family and given names',
+  JSON.stringify(stub.record.creators),
+)
+check(creatorWrite.stdout.includes('now reads back with every requested value'), 'and the tool says it read back')
+
+resetLibrary()
+const creatorClear = await runAsync(['--item', 'EDIT0001', '--set-creators', '', '--write'])
+check(creatorClear.status === 0, 'an empty list is a real change, not a no-op', `status ${creatorClear.status}`)
+check((stub.record.creators ?? []).length === 0, 'and it cleared the list', JSON.stringify(stub.record.creators))
+
+resetLibrary()
+const twoRecords = await runAsync(['--item', 'EDIT0001,EDIT0002', '--set-creators', 'author:Smith, John'])
+check(twoRecords.status === 2, 'one list is one record: two --item values are exit 2', `status ${twoRecords.status}`)
+
+resetLibrary()
+stub.creatorTypes = ['author', 'editor']
+const unsupported = await runAsync(['--item', 'EDIT0001', '--set-creators', 'presenter:Smith, John'])
+check(unsupported.status === 1, 'a creator type the item type lacks is refused', `status ${unsupported.status}`)
+check(unsupported.stderr.includes('this item type accepts author, editor'), 'and the refusal lists what is accepted', first(unsupported.stderr))
+check(writes().length === 0, 'and nothing was written', `${writes().length} write(s)`)
 
 // --- keys, actions, and the trash graph ----------------------------------------------------------
 

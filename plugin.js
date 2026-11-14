@@ -46,7 +46,7 @@ const CATALOG = [
   },
   {
     program: 'zotero-edit',
-    purpose: "change fields or tags on one or more items; restore trashed items, rewrite a note, or delete library tags; a dry run unless --write is given",
+    purpose: "change fields, the whole creator list, or tags on one or more items; restore trashed items, rewrite a note, or delete library tags; a dry run unless --write is given",
     example: ['--item', 'ABCD1234', '--set', 'title=A new title', '--write'],
   },
   {

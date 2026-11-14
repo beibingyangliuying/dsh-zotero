@@ -11,16 +11,19 @@
 //
 // WHAT IT WILL NOT CHANGE, AND WHY
 //
-// `creators` is a structured list of names and creator types, so a one-line value cannot express it;
-// rewriting it wrongly is not visible in the library's own list view. `itemType` decides which fields
-// exist at all, so changing it leaves the record carrying fields its new type does not have. `key` and
-// `version` belong to the library. Attachments, notes, and an item's filing are other tools' jobs.
-// The library is the right place to change all of those, with the record in front of you.
+// A creator list cannot be stated as one `field=value` line: it is names AND creator types, and a
+// silently mangled name is invisible in the library's own list view. It is therefore stated as the
+// WHOLE list with `--set-creators`, so the change reads as old list -> new list before it is sent,
+// and read back against that list afterwards - the one edit here that cannot be expressed as a field.
+// `itemType` decides which fields exist at all, so changing it leaves the record carrying fields its
+// new type does not have. `key` and `version` belong to the library. Attachments, notes, and an
+// item's filing are other tools' jobs. The library is the right place to change those.
 //
 // Usage:
 //   node tools/zotero-edit.mjs --item <itemKey> --set title="A new title"           # dry run
 //   node tools/zotero-edit.mjs --item <itemKey> --set DOI=10.xxxx/yyyy --write
 //   node tools/zotero-edit.mjs --item <itemKey> --set DOI=                        # clear a field
+//   node tools/zotero-edit.mjs --item <itemKey> --set-creators "author:Last, First; editor:Last, First"
 //   node tools/zotero-edit.mjs --item <itemKey> --add-tag /done --remove-tag /unread --write
 //   node tools/zotero-edit.mjs --item <k1,k2> --add-tag /reviewed --write   # one patch, every record
 //   node tools/zotero-edit.mjs --note <noteKey> --text '<p>new body</p>' --write
@@ -34,6 +37,7 @@ import {
   APP_NAME,
   childrenOf,
   createWriteGate,
+  creatorTypesForType,
   fieldNamesForType,
   getJson,
   isWriteAccepted,
@@ -70,11 +74,31 @@ export const EDITABLE_FIELDS = [
   'issue',
   'pages',
   'language',
+  'publisher',
+  'place',
+  'edition',
+  'series',
+  'seriesNumber',
+  'numberOfVolumes',
+  'institution',
+  'organization',
+  'conferenceName',
+  'proceedingsTitle',
+  'number',
+  'reportType',
+  'shortTitle',
+  'ISBN',
+  'ISSN',
+  'rights',
+  'archive',
+  'archiveLocation',
+  'libraryCatalog',
+  'callNumber',
 ]
 
 /** Fields a caller may plausibly try, each with the reason it is not a one-line edit. */
 export const REFUSED_FIELDS = {
-  creators: 'a creator list is structured (names and creator types); edit it in the application',
+  creators: 'a creator list is structured (names and creator types); state the whole list with --set-creators',
   itemType: 'the item type decides which fields exist, so changing it strands the others',
   key: 'the library owns the key',
   version: 'the library owns the version',
@@ -98,6 +122,52 @@ export const REFUSED_FIELDS = {
 export function invalidFields(fields, valid) {
   if (!valid) return []
   return Object.keys(fields).filter((field) => !valid.has(field))
+}
+
+/**
+ * One creator as a single line: `type: name`.
+ *
+ * A two-field creator is written `Last, First`; a single-field one (`name`) is written as it stands,
+ * with no comma. The same function reads back the library's answer, so the comparison after a write is
+ * made in exactly the form the user typed.
+ *
+ * @param {object} creator A Zotero creator: `{creatorType, lastName, firstName}` or `{creatorType, name}`.
+ * @returns {string} `type: Last, First`, or `type: name` for a single-field creator.
+ */
+export function formatCreator(creator) {
+  const type = creator?.creatorType || 'author'
+  const name = creator?.name || [creator?.lastName, creator?.firstName].filter(Boolean).join(', ')
+  return `${type}: ${name}`
+}
+
+/**
+ * Read one `--set-creators` value into a creator list.
+ *
+ * The form is the one a reader writes on paper: `author:Last, First; editor:Last, First`. A comma
+ * marks the end of the family name - which is exactly the marker that was missing when a fifth author
+ * was stored as `Carlos de la Llera, Juan` instead of `de la Llera, Juan Carlos`. A line with no comma
+ * is a SINGLE-FIELD name (`{name}`), not a guess at where the family name ends: splitting
+ * `World Health Organization` into a family name would be the same mistake in the other direction.
+ *
+ * @param {string} text The flag value; `''` is an empty list, which clears every creator.
+ * @returns {object[]} Creators for the item's `creators` field, in order.
+ * @throws {UsageError} When a line states a type and no name.
+ */
+export function parseCreatorList(text) {
+  return String(text ?? '')
+    .split(';')
+    .map((part) => part.trim())
+    .filter((part) => part !== '')
+    .map((part) => {
+      const split = part.indexOf(':')
+      const creatorType = split === -1 ? 'author' : part.slice(0, split).trim().toLowerCase()
+      const name = split === -1 ? part : part.slice(split + 1).trim()
+      if (name === '') throw new UsageError(`--set-creators takes 'type: Last, First', got '${part}'`)
+      const comma = name.indexOf(',')
+      return comma === -1
+        ? { creatorType, name }
+        : { creatorType, lastName: name.slice(0, comma).trim(), firstName: name.slice(comma + 1).trim() }
+    })
 }
 
 /**
@@ -262,13 +332,17 @@ export function flattenTrashGraph(graph) {
  */
 export function resolveAction(options) {
   const chosen = [
-    options.sets.length + options.add.length + options.remove.length > 0 ? 'edit' : '',
+    options.sets.length + options.add.length + options.remove.length > 0 || (options.creators ?? null) !== null
+      ? 'edit'
+      : '',
     options.restore.length > 0 ? 'restore' : '',
     options.note ? 'note' : '',
     options.purgeTags.length > 0 ? 'purge' : '',
   ].filter(Boolean)
   if (chosen.length === 0) {
-    throw new UsageError('pass one action: --set/--add-tag/--remove-tag, --restore, --note with --text, or --purge-tag')
+    throw new UsageError(
+      'pass one action: --set/--set-creators/--add-tag/--remove-tag, --restore, --note with --text, or --purge-tag',
+    )
   }
   if (chosen.length > 1) throw new UsageError(`pass ONE action, not ${chosen.join(' + ')}`)
   const [action] = chosen
@@ -281,15 +355,20 @@ export function resolveAction(options) {
 
 const USAGE =
   'usage: node tools/zotero-edit.mjs --item <key[,key...]> [--set field=value ...] [--add-tag T] [--remove-tag T] [--write]\n' +
+  '       node tools/zotero-edit.mjs --item <itemKey> --set-creators "<type>: Last, First; ..." [--write]\n' +
   '       node tools/zotero-edit.mjs --restore <key[,key...]> [--write]\n' +
   '       node tools/zotero-edit.mjs --note <key> --text <html> [--write]\n' +
   '       node tools/zotero-edit.mjs --purge-tag <tag> [--write]\n' +
-  `       editable fields: ${EDITABLE_FIELDS.join(', ')}`
+  `       editable fields: ${EDITABLE_FIELDS.join(', ')}\n` +
+  '       --set-creators states the WHOLE creator list, in order: a comma ends the family name, a\n' +
+  '       line with no comma is a single-field name, a leading type defaults to author, and "" clears\n' +
+  '       the list. It applies to one record, because a list replaced per record is not one change.'
 
 function parseArgs(argv) {
   const options = {
     items: [],
     sets: [],
+    creatorsRaw: [],
     add: [],
     remove: [],
     write: false,
@@ -298,7 +377,17 @@ function parseArgs(argv) {
     text: null,
     purgeTags: [],
   }
-  const valued = ['--item', '--set', '--add-tag', '--remove-tag', '--restore', '--note', '--text', '--purge-tag']
+  const valued = [
+    '--item',
+    '--set',
+    '--set-creators',
+    '--add-tag',
+    '--remove-tag',
+    '--restore',
+    '--note',
+    '--text',
+    '--purge-tag',
+  ]
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index]
     if (flag === '--write') {
@@ -310,6 +399,7 @@ function parseArgs(argv) {
     if (next === undefined) throw new UsageError(`${flag} needs a value`)
     if (flag === '--item') options.items.push(next)
     if (flag === '--set') options.sets.push(next)
+    if (flag === '--set-creators') options.creatorsRaw.push(next)
     if (flag === '--add-tag') options.add.push(next)
     if (flag === '--remove-tag') options.remove.push(next)
     if (flag === '--restore') options.restore.push(next)
@@ -318,7 +408,13 @@ function parseArgs(argv) {
     if (flag === '--purge-tag') options.purgeTags.push(next)
     index += 1
   }
-  return { ...options, items: parseItemKeys(options.items), restore: parseItemKeys(options.restore) }
+  if (options.creatorsRaw.length > 1) throw new UsageError('pass --set-creators once: it states one whole list')
+  return {
+    ...options,
+    creators: options.creatorsRaw.length === 0 ? null : parseCreatorList(options.creatorsRaw[0]),
+    items: parseItemKeys(options.items),
+    restore: parseItemKeys(options.restore),
+  }
 }
 
 /** Order two exit codes by what the caller should act on: unconfirmed outranks refused. */
@@ -333,7 +429,9 @@ function printConflict(key, result, current) {
   console.error(`  version : ${current.version}`)
   for (const field of Object.keys(result.patch ?? {})) {
     if (field === 'tags') console.error(`  tags    : ${normalizeTags(current.tags).join(' · ') || 'none'}`)
-    else console.error(`  ${field.padEnd(7)} : ${JSON.stringify(current[field] ?? '')}`)
+    else if (field === 'creators') {
+      console.error(`  creators: ${(current.creators ?? []).map(formatCreator).join(' · ') || 'none'}`)
+    } else console.error(`  ${field.padEnd(7)} : ${JSON.stringify(current[field] ?? '')}`)
   }
 }
 
@@ -342,7 +440,7 @@ function printConflict(key, result, current) {
  *
  * @returns {Promise<number>} 0 planned or applied, 1 refused, 3 unconfirmed.
  */
-async function editOne({ gate, key, fields, add, remove, write, single }) {
+async function editOne({ gate, key, fields, creators = null, add, remove, write, single }) {
   let before
   try {
     before = await readItem(key)
@@ -364,14 +462,37 @@ async function editOne({ gate, key, fields, add, remove, write, single }) {
   }
   const currentTags = normalizeTags(before.tags)
   const tagChange = computeTagChange(currentTags, { add, remove })
-  const patch = { ...fields }
-  if (!tagChange.unchanged) patch.tags = tagChange.next.map((tag) => ({ tag }))
-  const changes = changedFields(before, patch)
+  const currentCreators = (before.creators ?? []).map(formatCreator)
+  const wantedCreators = creators === null ? null : creators.map(formatCreator)
+  if (creators !== null) {
+    const allowed = await creatorTypesForType(before.itemType)
+    const unsupported =
+      allowed === null
+        ? []
+        : [...new Set(creators.map((creator) => creator.creatorType))].filter((type) => !allowed.includes(type))
+    if (unsupported.length > 0) {
+      const refusal = new Refusal(
+        `${before.itemType} does not accept the creator type ${unsupported.map((type) => `'${type}'`).join(', ')}`,
+        { fix: `this item type accepts ${allowed.join(', ')}` },
+      )
+      if (single) throw refusal
+      console.error(`item ${key}: ${refusal.message}; skipped`)
+      return 1
+    }
+  }
+  const creatorsChange =
+    wantedCreators !== null && JSON.stringify(wantedCreators) !== JSON.stringify(currentCreators)
+  // `creators` is compared by {@link formatCreator}, not by `changedFields`: the latter stringifies an
+  // array, which would print the patch as `[object Object],...` and call any list a change.
+  const fieldPatch = { ...fields }
+  if (!tagChange.unchanged) fieldPatch.tags = tagChange.next.map((tag) => ({ tag }))
+  const patch = creators === null ? fieldPatch : { ...fieldPatch, creators }
+  const changes = changedFields(before, fieldPatch)
 
   console.log(`\nitem    : ${key}  [${before.itemType}]  "${before.title ?? ''}"`)
   console.log(`version : ${before.version}`)
 
-  if (changes.length === 0) {
+  if (changes.length === 0 && !creatorsChange) {
     console.log('No change: every value asked for is already what the record says.')
     return 0
   }
@@ -385,8 +506,37 @@ async function editOne({ gate, key, fields, add, remove, write, single }) {
       console.log(`     -> : ${JSON.stringify(change.to)}`)
     }
   }
+  if (creatorsChange) {
+    console.log(`creators: ${currentCreators.length} now -> ${wantedCreators.length} after, in this order`)
+    wantedCreators.forEach((line, index) => {
+      const was = currentCreators[index]
+      if (was === line) {
+        console.log(`       = : ${line}`)
+        return
+      }
+      if (was !== undefined) console.log(`       - : ${was}`)
+      console.log(`       + : ${line}`)
+    })
+    for (let index = wantedCreators.length; index < currentCreators.length; index += 1) {
+      console.log(`       - : ${currentCreators[index]}`)
+    }
+  }
   console.log(`body    : ${JSON.stringify(patch)}`)
   console.log(`write   : PATCH /api/users/0/items/${key}  If-Unmodified-Since-Version: ${before.version}`)
+
+  // The re-read is compared in the same form the plan was printed in: a creator list is compared
+  // line by line (the library returns objects), every other field as the string the record holds.
+  const notReadBack = (record) => {
+    const left = fieldsNotReadBack(record, changes, tagChange)
+    if (
+      creatorsChange &&
+      JSON.stringify((record.creators ?? []).map(formatCreator)) !== JSON.stringify(wantedCreators)
+    ) {
+      left.push('creators')
+    }
+    return left
+  }
+  const changedNames = [...changes.map((change) => change.field), ...(creatorsChange ? ['creators'] : [])]
 
   if (!write) return 0
 
@@ -409,11 +559,11 @@ async function editOne({ gate, key, fields, add, remove, write, single }) {
       // a 5xx after a sent PATCH is not a refusal, and "nothing was written" would invite a resend.
       const after = await readItem(key).catch(() => null)
       const left = after
-        ? fieldsNotReadBack(after, changes, tagChange)
+        ? notReadBack(after)
         : ['the re-read failed too, so even this is unproven']
       return reportUnconfirmed({
         key,
-        what: `the ${fieldsOf(changes)} change on ${key} answered HTTP ${result.status}${
+        what: `the ${changedNames.join(', ')} change on ${key} answered HTTP ${result.status}${
           result.detail ? ` (${result.detail.slice(0, 200)})` : ''
         }`,
         found: after
@@ -428,7 +578,7 @@ async function editOne({ gate, key, fields, add, remove, write, single }) {
   }
 
   const after = result.after
-  const mismatched = fieldsNotReadBack(after, changes, tagChange)
+  const mismatched = notReadBack(after)
   if (mismatched.length > 0) {
     return reportUnconfirmed({
       key,
@@ -441,6 +591,10 @@ async function editOne({ gate, key, fields, add, remove, write, single }) {
 }
 
 async function runEdit(options, gate) {
+  const creators = options.creators ?? null
+  if (creators !== null && options.items.length > 1) {
+    throw new UsageError("--set-creators states one record's whole list; pass ONE --item")
+  }
   const fields = parseSetFlags(options.sets)
   let code = 0
   for (const key of options.items) {
@@ -450,6 +604,7 @@ async function runEdit(options, gate) {
         gate,
         key,
         fields,
+        creators,
         add: options.add,
         remove: options.remove,
         write: options.write,
@@ -678,11 +833,6 @@ async function main() {
   if (action === 'restore') return runRestore(options, gate)
   if (action === 'note') return runNote(options, gate)
   return runPurge(options, gate)
-}
-
-/** The fields a change list names, in one phrase. */
-function fieldsOf(changes) {
-  return changes.map((change) => change.field).join(', ')
 }
 
 /**
