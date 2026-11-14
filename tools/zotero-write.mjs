@@ -53,7 +53,10 @@ import {
   reportUnconfirmed,
   serverInfo,
 } from './zotero-local-api.mjs'
-import { UsageError, reportFailure, reportHelp, wantsHelp } from './refusal.mjs'
+import { Refusal, UsageError, reportFailure, reportHelp, wantsHelp } from './refusal.mjs'
+// The identifiers are compared in the one form this preset already normalizes them into, so a DOI
+// written `https://doi.org/10.x/y` here and `10.x/y` there is the same work.
+import { normalizeTitle, sameDoi } from './zotero-read.mjs'
 
 const USAGE =
   'usage: node tools/zotero-write.mjs --arxiv <id> [--collection <key> ...] [--force] [--write]\n' +
@@ -102,6 +105,9 @@ const KEY_SHAPE = /^[A-Z0-9]{8}$/
  * actually lives rather than written down.
  */
 const COLLECTION_TOOL = fileURLToPath(new URL('./zotero-collection.mjs', import.meta.url))
+
+/** The metadata program, as an absolute path, named the same way in every command this file prints. */
+const METADATA_TOOL = fileURLToPath(new URL('./metadata.mjs', import.meta.url))
 
 /**
  * Collections named with `--collection`, uppercased, deduplicated, in first-seen order.
@@ -299,10 +305,53 @@ async function metadataFromArxiv(arxivId) {
   }
 }
 
+/**
+ * Why Crossref did not answer for one DOI, as a refusal that names another way to ask.
+ *
+ * A 404 here is not "no such work". Crossref indexes the registration agencies that report to it, and a
+ * Chinese, Japanese or institutional DOI is often registered elsewhere - measured: both Chinese
+ * references of one list answered 404 and were created by hand from their volume and pages. Calling
+ * again changes nothing, and printing a bare failure teaches the reader that the work does not exist.
+ *
+ * @param {string} doi The DOI in {@link sameDoi}'s form.
+ * @param {number} status The HTTP status Crossref answered with.
+ * @returns {Refusal} The refusal to throw.
+ */
+export function crossrefRefusal(doi, status) {
+  if (status === 404 || status === 410) {
+    return new Refusal(`Crossref has no record for ${doi} (HTTP ${status})`, {
+      fix:
+        'the DOI may be registered with an agency Crossref does not index (Chinese, Japanese, institutional), ' +
+        'so this does not mean the work is absent. doi.org resolves any registered DOI and answers in citation ' +
+        'form through this suite\'s --cite mode of the metadata program; a publisher page then supplies the ' +
+        'volume and pages a manual --field create needs',
+      command: `node "${METADATA_TOOL}" --doi ${doi} --source openalex`,
+      checked: ['Crossref'],
+    })
+  }
+  if (status === 429) {
+    return new Refusal(`Crossref is rate-limiting this client (HTTP 429)`, {
+      fix: 'wait a minute, then run the same command again; nothing was decided about the DOI itself',
+    })
+  }
+  return new Refusal(`Crossref answered HTTP ${status} for ${doi}`, {
+    fix: 'that is a transport or server fault, not a missing record: run the same command again',
+  })
+}
+
 async function metadataFromCrossref(doi) {
+  const bare = sameDoi(doi)
+  if (bare === '') throw new UsageError(`--doi needs a DOI, got '${doi}'`)
   const contact = contactAddress() ? `?mailto=${encodeURIComponent(contactAddress())}` : ''
-  const res = await fetch(`https://api.crossref.org/works/${encodeURIComponent(doi)}${contact}`)
-  if (!res.ok) throw new Error(`Crossref answered ${res.status} for ${doi}`)
+  let res
+  try {
+    res = await fetch(`https://api.crossref.org/works/${encodeURIComponent(bare)}${contact}`)
+  } catch (error) {
+    throw new Refusal(`Crossref could not be reached for ${bare}`, {
+      fix: `the request failed before any answer came back (${error.message}); nothing has been written`,
+    })
+  }
+  if (!res.ok) throw crossrefRefusal(bare, res.status)
   const m = (await res.json()).message
   const date = m.issued?.['date-parts']?.[0] ?? []
   return {
@@ -319,7 +368,7 @@ async function metadataFromCrossref(doi) {
     volume: m.volume ?? '',
     issue: m.issue ?? '',
     pages: m.page ?? '',
-    DOI: m.DOI ?? doi,
+    DOI: sameDoi(m.DOI) || bare,
     url: m.URL ?? '',
     language: m.language ?? '',
     ISSN: (m.ISSN ?? []).join(', '),
@@ -353,21 +402,39 @@ async function createItem(item, gate) {
   return { status: res.status, text: res.text }
 }
 
+/**
+ * The record in `hits` that the payload would duplicate, or null.
+ *
+ * Compared in normalized form. Exact string equality used to decide this, so a DOI stored as a
+ * resolver URL here and bare there, or a title differing by a hyphen or a trailing period, created a
+ * second record of the same work. An empty DOI is never equal to another empty one: a missing
+ * identifier means the two records have NOT been shown to be the same.
+ *
+ * @param {object[]} hits Search rows as the library returns them.
+ * @param {object} meta The payload's metadata.
+ * @returns {{key: string, title: string}|null} The duplicate, if any.
+ */
+export function matchingRecord(hits, meta) {
+  const wantedDoi = sameDoi(meta.DOI)
+  const wantedTitle = normalizeTitle(meta.title)
+  const hit = hits.find((row) => {
+    const data = row.data ?? {}
+    if (wantedDoi !== '' && sameDoi(data.DOI) === wantedDoi) return true
+    if (wantedTitle !== '' && normalizeTitle(data.title) === wantedTitle) return true
+    return Boolean(meta.archiveID) && data.archiveID === meta.archiveID
+  })
+  return hit ? { key: hit.key, title: hit.data?.title ?? '' } : null
+}
+
 /** Refuse to create a second copy of something already in the library. */
 async function findExisting(meta) {
-  const query = (meta.title || '').split(/\s+/).slice(0, 6).join(' ')
+  const query = (meta.title || '').split(/\s+/).slice(0, 6).join(' ').trim() || sameDoi(meta.DOI)
   if (!query) return null
   const res = await localRequest('GET', `/api/users/0/items?q=${encodeURIComponent(query)}&limit=25`)
   if (res.status !== 200) return null
   const hits = JSON.parse(res.text)
   if (!Array.isArray(hits)) return null
-  const hit = hits.find(
-    (h) =>
-      h.data?.title === meta.title ||
-      (meta.DOI && h.data?.DOI === meta.DOI) ||
-      (meta.archiveID && h.data?.archiveID === meta.archiveID),
-  )
-  return hit ? { key: hit.key, title: hit.data.title } : null
+  return matchingRecord(hits, meta)
 }
 
 /** Rows per request when the collection keys are checked. The library's own page size for `/items`. */

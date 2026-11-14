@@ -24,6 +24,8 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   collectionKeyProblems,
+  crossrefRefusal,
+  matchingRecord,
   parseCollectionKeys,
   unfiledCollections,
   unknownCollections,
@@ -136,7 +138,56 @@ check(
 check(/readItem\(itemKey\)/.test(SOURCE), 'the created record is read back')
 check(/withCollections\(bare, wanted\)/.test(SOURCE), 'the body posted is the one the dry run printed')
 
-console.log("\n[7] the command line against a stub library and a stub arXiv, not the owner's")
+console.log('\n[7] a DOI is compared in one form, and a Crossref 404 is not a missing work')
+
+// The duplicate guard used to compare exact strings, so `https://doi.org/10.x/y` in the library and
+// `10.x/y` in the payload were two different works and the second one was created.
+const held = [{ key: 'HELD0001', data: { title: 'Seismic resilience of networks', DOI: 'https://doi.org/10.1016/J.RESS.2023.109755' } }]
+check(
+  matchingRecord(held, { title: 'Something else', DOI: '10.1016/j.ress.2023.109755' })?.key === 'HELD0001',
+  'a DOI stored as a resolver URL is the same DOI as the bare one',
+)
+check(
+  matchingRecord([{ key: 'TITLE001', data: { title: 'Seismic Resilience of Networks.' } }], { title: 'seismic resilience of networks' })?.key ===
+    'TITLE001',
+  'a title differing only in case and trailing punctuation is the same work',
+)
+check(
+  matchingRecord([{ key: 'EMPTY001', data: { title: 'x', DOI: '' } }], { title: 'y', DOI: '' }) === null,
+  'two empty DOIs are not a match: a missing identifier has not shown anything',
+)
+check(
+  matchingRecord([{ key: 'OTHER001', data: { title: 'x', DOI: '10.1/other' } }], { title: 'y', DOI: '10.1/wanted' }) === null,
+  'a different DOI is not a duplicate',
+)
+check(
+  matchingRecord([{ key: 'ARXIV001', data: { title: 'x', archiveID: 'arXiv:1706.03762' } }], { title: 'y', archiveID: 'arXiv:1706.03762' })
+    ?.key === 'ARXIV001',
+  'the arXiv id still settles a preprint with no title or DOI match',
+)
+
+// A 404 from Crossref is the case that made two Chinese references look absent. It must not be
+// reported as a plain failure, and the refusal must name a program that can still answer.
+const notIndexed = crossrefRefusal('10.19999/cn.2025.0102', 404)
+check(
+  /^node ".*metadata\.mjs" --doi 10\.19999\/cn\.2025\.0102 --source openalex$/.test(notIndexed.command),
+  'a 404 names an absolute-path command against another index',
+  notIndexed.command,
+)
+check(
+  notIndexed.fix.includes('doi.org') && notIndexed.fix.includes('--cite') && notIndexed.fix.includes('manual --field'),
+  'and says doi.org answers in citation form, and that a manual create is the remaining way',
+  notIndexed.fix.slice(0, 60),
+)
+check(JSON.stringify(notIndexed.checked) === '["Crossref"]', 'the refusal states what was checked')
+check(crossrefRefusal('10.1/x', 429).fix.includes('wait'), 'a 429 is rate limiting, not a verdict on the DOI')
+check(crossrefRefusal('10.1/x', 503).fix.includes('not a missing record'), 'a 5xx is a transport fault, and says so')
+check(
+  /const bare = sameDoi\(doi\)/.test(SOURCE) && /crossrefRefusal\(bare, res\.status\)/.test(SOURCE),
+  'the resolver sends the normalized DOI and refuses through that helper',
+)
+
+console.log("\n[8] the command line against a stub library and a stub arXiv, not the owner's")
 
 const scratch = mkdtempSync(join(tmpdir(), 'write-cli-'))
 const grantPath = join(scratch, 'grant.json')
