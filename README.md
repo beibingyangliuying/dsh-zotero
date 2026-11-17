@@ -32,7 +32,7 @@ preset 用 `import.meta.resolve('@beibingyangliuying/dsh-zotero/tools-dir')` 取
 ## 安装
 
 ```console
-dsh plugin --profile web add github:beibingyangliuying/dsh-zotero#v0.3.0
+dsh plugin --profile web add github:beibingyangliuying/dsh-zotero#v0.4.0
 ```
 
 它是 `dsh-autoresearch` 的 **peer**（pnpm 不允许 git 解析的子依赖），所以先装它、再装 preset。
