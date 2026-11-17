@@ -46,14 +46,14 @@ dsh plugin --profile web add github:beibingyangliuying/dsh-zotero#v0.3.0
 | `zotero-write.mjs` | 新增条目（DOI / arXiv / 手工字段 / 笔记），默认 dry run |
 | `zotero-edit.mjs` | 字段、作者表与标签编辑（可批量）、单条记录删除、回收站恢复、改笔记、删库级标签 |
 | `zotero-remark.mjs` | 只换 remark 那一行，必须背出旧值 |
-| `zotero-section-note.mjs` | 分节笔记（最大的一块） |
+| `zotero-section-note.mjs` | 分节笔记（最大的一块，`--batch` 一次写多条） |
 | `zotero-collection.mjs` | 合集增删改与归档、保存搜索管理 |
 | `zotero-export.mjs` | 引用格式化与导出（含 CSV、`--output` 落盘） |
 | `zotero-pdf.mjs` | PDF 大纲、抽取与渲染（无书签时按正文标题行给候选） |
 | `zotero-link-attachments.mjs` | 存储附件转链接附件 |
 | `zotero-ensure.mjs` | 启动 / 探测本地 Zotero |
 | `arxiv.mjs` | arXiv 检索（自己的查询语法） |
-| `metadata.mjs` | 书目 REST：标识符、venue、计数 |
+| `metadata.mjs` | 书目 REST：标识符、venue、计数、核验（连摘要一起给） |
 | `scholarly.mjs` | 多索引融合发现 |
 | `scholarly-read.mjs` | 开放获取全文读取 |
 | `journal-rank.mjs` | 期刊分区 |

@@ -77,7 +77,7 @@
 // Exit codes: 0 applied and read back, or nothing to do | 1 refused, and nothing was written |
 // 2 usage | 3 sent or written but NOT confirmed - the note may exist, so never resend it.
 import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { UsageError, reportFailure, reportHelp, wantsHelp } from './refusal.mjs'
 import { APP_NAME, childrenOf, createdItemKey, createWriteGate, isWriteAccepted, localRequest, patchItem, readItem, visibleText } from './zotero-local-api.mjs'
@@ -946,6 +946,61 @@ function reportUnconfirmed(noteKey, detail) {
   process.exitCode = 3
 }
 
+const BATCH_KEYS = new Set(['item', 'section', 'text', 'file', 'replaces', 'acknowledgeUnknown'])
+
+/**
+ * Read a batch manifest into the entries one run can plan and one `--write` can apply.
+ *
+ * The manifest names what each note is about, one object per note. No file name is parsed: a name is
+ * a convention, and a tool that reads a convention as a protocol cannot express an exception - the
+ * manifest is where an entry says "§4 of this record is in that file" without a rename.
+ *
+ * @param {string} json The manifest file's text.
+ * @param {{baseDir?: string}} [where] What relative `file` paths resolve against.
+ * @returns {object[]} One options-shaped object per entry, in manifest order.
+ */
+export function parseBatchManifest(json, { baseDir = '.' } = {}) {
+  let data
+  try {
+    data = JSON.parse(json)
+  } catch (error) {
+    throw new UsageError(`the manifest is not JSON: ${error.message}`)
+  }
+  if (!Array.isArray(data)) {
+    throw new UsageError('the manifest is one JSON array of entries: [{ "item": "<recordKey>", "section": "<ordinal>", "file": "<path>" }]')
+  }
+  if (data.length === 0) throw new UsageError('the manifest has no entries')
+  const seen = new Set()
+  return data.map((raw, index) => {
+    const where = `entry ${index + 1}`
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) throw new UsageError(`${where} is not an object`)
+    const unknown = Object.keys(raw).filter((key) => !BATCH_KEYS.has(key))
+    if (unknown.length) {
+      throw new UsageError(`${where} carries ${unknown.join(', ')}, which an entry does not have (it takes ${[...BATCH_KEYS].join(', ')})`)
+    }
+    const item = String(raw.item ?? '').trim()
+    const section = String(raw.section ?? '').trim()
+    if (!item) throw new UsageError(`${where} has no "item"`)
+    if (!section) throw new UsageError(`${where} has no "section"`)
+    const text = typeof raw.text === 'string' && raw.text.trim() !== '' ? raw.text : ''
+    const file = typeof raw.file === 'string' && raw.file.trim() !== '' ? resolve(baseDir, raw.file.trim()) : ''
+    if ((text === '') === (file === '')) throw new UsageError(`${where} needs exactly one of "text" and "file"`)
+    const name = `${item} §${section}`
+    if (seen.has(name)) {
+      throw new UsageError(`${where} repeats ${name}: writing one section twice is a mistake, not an instruction`)
+    }
+    seen.add(name)
+    return {
+      item,
+      section,
+      text,
+      file,
+      replaces: String(raw.replaces ?? '').trim(),
+      acknowledgeUnknown: String(raw.acknowledgeUnknown ?? '').trim(),
+    }
+  })
+}
+
 /** Create one section note, refusing when the section is already claimed. */
 async function runCreate(options) {
   const body = options.file ? readFileSync(options.file, 'utf8') : options.text
@@ -1099,6 +1154,42 @@ async function runCreate(options) {
   console.log(`\nOK - note ${noteKey} carries §${token} and ${AGENT_TAG} on ${options.item} (now ${back.note.length} characters, version ${back.version}).` + (replacedKey ? ` It replaces ${replacedKey}.` : ''))
   console.log(`It is a DRAFT: ${REVIEWED_TAG} is the owner's act (--review --note ${noteKey}), and until then an`)
   console.log('adoption may treat it as a candidate only.')
+}
+
+/**
+ * Create the notes a manifest lists, one entry at a time.
+ *
+ * Each entry goes through the same read, refusal and read-back as a single `--section`, so a batch is
+ * not a faster channel - it is the same channel with the process started once. The run stops at the
+ * first entry that does not read back, because a batch that keeps writing past an unconfirmed write
+ * produces a record whose state no summary can describe.
+ */
+async function runBatch(options) {
+  let source
+  try {
+    source = readFileSync(options.batch, 'utf8')
+  } catch (error) {
+    throw new UsageError(`the manifest ${options.batch} could not be read: ${error.code ?? error.message}`)
+  }
+  const entries = parseBatchManifest(source, { baseDir: dirname(resolve(options.batch)) })
+  console.log(`batch   : ${entries.length} entries from ${options.batch}`)
+  console.log(`write   : ${options.write ? 'each entry in turn, stopping at the first one that is not confirmed' : 'none - this is a dry run'}`)
+  const done = []
+  for (const [index, entry] of entries.entries()) {
+    console.log(`\n--- ${index + 1}/${entries.length}  ${entry.item}  §${entry.section}`)
+    process.exitCode = 0
+    await runCreate({ ...entry, write: options.write, plan: false, json: false })
+    const code = process.exitCode ?? 0
+    if (code !== 0) {
+      console.log(`\nbatch   : stopped at entry ${index + 1} of ${entries.length} (exit ${code}).`)
+      console.log(`done    : ${done.length ? done.map((row) => `${row.item} §${row.section}`).join(' · ') : 'none'}`)
+      const left = entries.slice(index + 1)
+      if (left.length) console.log(`skipped : ${left.map((row) => `${row.item} §${row.section}`).join(' · ')} - not attempted`)
+      return
+    }
+    done.push(entry)
+  }
+  console.log(`\nbatch   : ${done.length} of ${entries.length} ${options.write ? 'written and read back' : 'planned and clean'}.`)
 }
 
 /**
@@ -1720,6 +1811,7 @@ const USAGE =
   '       node tools/zotero-section-note.mjs --retire --note <noteKey> --undo [--write]\n' +
   '       node tools/zotero-section-note.mjs --review --note <noteKey> [--undo] [--write]\n' +
   '       node tools/zotero-section-note.mjs --delete --note <noteKey> [--write]\n' +
+  '       node tools/zotero-section-note.mjs --batch <manifest.json> [--write]\n' +
   '       Identity is a tag: /section-N claims a top-level section, /imported marks an import that may\n' +
   '       still be rewritten, /agent-note marks a body an agent wrote from the paper, /reviewed marks the\n' +
   '       owner accepting that body, /repaired marks a body corrected in place, /digest is a LEGACY\n' +
@@ -1733,17 +1825,22 @@ const USAGE =
   '       ambiguity, never a disagreement with a single claim.\n' +
   '       --delete erases only a /retired note, permanently: this API has no trash, and the plan states\n' +
   '       that before --write is accepted.\n' +
+  '       --batch takes one JSON array of entries, each {"item", "section", "text" or "file",\n' +
+  '       "replaces"?, "acknowledgeUnknown"?}; relative "file" paths resolve against the manifest\'s\n' +
+  '       directory, and no file name is read as a protocol. Every entry is planned, refused and read\n' +
+  '       back exactly as a single --section is, and the run stops at the first entry it cannot confirm,\n' +
+  '       printing what was done and what was not attempted.\n' +
   '       Exit 0 = written and read back | 1 = refused, nothing written | 2 = usage |\n' +
   '       3 = sent or written but NOT confirmed - read the record before retrying, never resend.'
 
 function parseArgs(argv) {
   const options = {
-    item: '', note: '', section: '', text: '', file: '', reason: '', replaces: '', acknowledgeUnknown: '',
+    item: '', note: '', section: '', text: '', file: '', reason: '', replaces: '', acknowledgeUnknown: '', batch: '',
     claim: false, unclaim: false, rewrite: false, repair: false, delete: false, retire: false, review: false,
     mechanical: false, substantive: false, undo: false,
     plan: false, json: false, write: false,
   }
-  const valued = new Set(['--item', '--note', '--section', '--text', '--file', '--reason', '--replaces', '--acknowledge-unknown'])
+  const valued = new Set(['--item', '--note', '--section', '--text', '--file', '--reason', '--replaces', '--acknowledge-unknown', '--batch'])
   const switches = new Set(['--claim', '--unclaim', '--rewrite', '--repair', '--delete', '--retire', '--review', '--mechanical', '--substantive', '--undo', '--plan', '--json', '--write'])
   const keyOf = (flag) => flag.slice(2).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())
   for (let index = 0; index < argv.length; index += 1) {
@@ -1768,6 +1865,21 @@ function parseArgs(argv) {
   if (options.acknowledgeUnknown && !options.section) throw new UsageError('--acknowledge-unknown belongs to a --section create')
   if (options.json && (modes.length || options.section || options.text || options.file || options.replaces || options.note)) {
     throw new UsageError('--json prints the coverage plan; it goes with --item and nothing else')
+  }
+
+  if (options.batch) {
+    const extra = [
+      options.item && '--item', options.note && '--note', options.section && '--section',
+      options.text && '--text', options.file && '--file', options.reason && '--reason',
+      options.replaces && '--replaces', options.acknowledgeUnknown && '--acknowledge-unknown',
+      options.plan && '--plan', options.json && '--json', options.undo && '--undo',
+      options.mechanical && '--mechanical', options.substantive && '--substantive',
+      ...modes.map((mode) => `--${mode}`),
+    ].filter(Boolean)
+    if (extra.length) {
+      throw new UsageError(`--batch carries its own item, section and body for every entry; drop ${extra.join(', ')}`)
+    }
+    return options
   }
 
   if (options.claim) {
@@ -1853,6 +1965,10 @@ function parseArgs(argv) {
 
 async function main() {
   const options = parseArgs(process.argv.slice(2))
+  if (options.batch) {
+    await runBatch(options)
+    return
+  }
   if (options.claim) {
     await runClaim(options)
     return

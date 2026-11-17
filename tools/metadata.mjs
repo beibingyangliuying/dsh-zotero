@@ -40,6 +40,13 @@
 //     everyone on your network's IP address. The mailto parameter doesn't raise this limit." The
 //     notice is printed when the API sends one, rather than leaving a reader to infer from the
 //     discipline that the parameter buys quota. Crossref still wants the address; this is per source.
+//   * A CROSSREF ABSTRACT IS A PUBLISHER DEPOSIT, NOT A PROPERTY OF THE DOI: measured 2026-11-17,
+//     `10.1002/eqe.3810` deposits one (2,709 characters, opening with the word "Abstract"), while
+//     `10.1016/j.ress.2023.109755` and `10.1038/nature14539` deposit none. So `--verify` prints the
+//     abstract when it is there and says "absent in this record" when it is not - it never asks a
+//     second channel to fill the gap, because a different index's abstract is a different quote. The
+//     deposit's own wording is quoted as deposited: the leading "Abstract" label is left where the
+//     publisher put it, since stripping it would edit a quote to look tidier.
 //   * A TITLE-SHAPED SEARCH ON OPENALEX IS A FULL-TEXT SEARCH: `attention is all you need` answered
 //     `total 3230801`, with the API's own reading "get works where full text has (attention is all you
 //     need)". A large `total` is not "many works with this title", so that reading is printed beside it.
@@ -58,6 +65,7 @@
 //   node tools/metadata.mjs --refs 10.1038/s41586-021-03819-2
 //   node tools/metadata.mjs --cited-by W2626778328
 //   node tools/metadata.mjs --oa 10.1038/s41586-021-03819-2 --mailto you@example.org
+//   node tools/metadata.mjs --verify 10.1002/eqe.3810 --abstract 400 --expect-year 2017
 //   node tools/metadata.mjs --selftest
 //
 // Exit codes: 0 answered, including zero results | 1 the request or the response failed | 2 usage.
@@ -503,7 +511,7 @@ const USAGE =
   '       node tools/metadata.mjs --cited-by <openalex-id> [--rows 1-10] [--mailto <address>]\n' +
   '       node tools/metadata.mjs --oa <doi> --mailto <address>\n' +
   '       node tools/metadata.mjs --cite <doi|arxiv-id> [--format bibtex|ris|csljson|text] [--style apa] [--locale en-US]\n' +
-  '       node tools/metadata.mjs --verify <doi> [--expect-title "<title>"] [--expect-year YYYY] [--expect-author "<surname>"]\n' +
+  '       node tools/metadata.mjs --verify <doi> [--expect-title "<title>"] [--expect-year YYYY] [--expect-author "<surname>"] [--abstract N]\n' +
   '       node tools/metadata.mjs --related <doi|openalex-id>\n' +
   '       node tools/metadata.mjs --selftest'
 
@@ -633,7 +641,9 @@ export function parseArgs(argv) {
   }
   const abstract = value('abstract')
   if (abstract !== null) {
-    if (!['doi', 'refs'].includes(options.mode)) throw new UsageError(`--abstract applies to a work record, not to --${options.mode}`)
+    if (!['doi', 'refs', 'verify'].includes(options.mode)) {
+      throw new UsageError(`--abstract applies to a work record, not to --${options.mode}`)
+    }
     options.abstractChars = integer('abstract', abstract, { min: 0, max: 20_000 })
   }
   const mailto = value('mailto')
@@ -669,6 +679,30 @@ function today() {
 }
 
 /**
+ * The abstract, or the reason there is none, in the same words wherever a record is printed.
+ *
+ * One helper rather than one copy per report: a `--doi` reader and a `--verify` reader ask the same
+ * question of the same field, and two wordings would make the two reports disagree about absence.
+ *
+ * @param {object} work A normalized record.
+ * @param {number} [limit] Characters to show; 0 omits the text and says how many are available.
+ * @returns {string} One line for a report.
+ */
+export function abstractLine(work, limit = DEFAULT_ABSTRACT_CHARS) {
+  if (work.abstract === '') {
+    return work.source === 'openalex'
+      ? 'abstract : (absent in this record - OpenAlex ships only abstract_inverted_index and it is often missing; do not write one from the title)'
+      : 'abstract : (absent in this record - do not write one from the title)'
+  }
+  if (limit === 0) {
+    return `abstract : [omitted by --abstract 0; ${work.abstract.length} characters available from this record]`
+  }
+  const rebuilt = work.source === 'openalex' ? '  [rebuilt from abstract_inverted_index]' : ''
+  if (work.abstract.length <= limit) return `abstract : ${work.abstract}${rebuilt}`
+  return `abstract : ${work.abstract.slice(0, limit)} ... [${work.abstract.length - limit} characters held back; --abstract ${work.abstract.length} shows all]${rebuilt}`
+}
+
+/**
  * One work record as lines a report can quote.
  *
  * @param {object} work A normalized record.
@@ -700,22 +734,7 @@ export function formatWork(work, context) {
   }
   const count = work.references.length
   lines.push(`refs     : ${count}${count > 0 ? '  (--refs lists them)' : ''}`)
-  const limit = context.abstractChars
-  if (work.abstract === '') {
-    lines.push(
-      work.source === 'openalex'
-        ? 'abstract : (absent in this record - OpenAlex ships only abstract_inverted_index and it is often missing; do not write one from the title)'
-        : 'abstract : (absent in this record - do not write one from the title)',
-    )
-  } else if (limit === 0) {
-    lines.push(`abstract : [omitted by --abstract 0; ${work.abstract.length} characters available from this record]`)
-  } else if (work.abstract.length <= limit) {
-    lines.push(`abstract : ${work.abstract}${work.source === 'openalex' ? '  [rebuilt from abstract_inverted_index]' : ''}`)
-  } else {
-    lines.push(
-      `abstract : ${work.abstract.slice(0, limit)} ... [${work.abstract.length - limit} characters held back; --abstract ${work.abstract.length} shows all]${work.source === 'openalex' ? '  [rebuilt from abstract_inverted_index]' : ''}`,
-    )
-  }
+  lines.push(abstractLine(work, context.abstractChars))
   return lines.join('\n')
 }
 
@@ -810,11 +829,16 @@ export function formatOa(record) {
 /**
  * One registry record as a verification report.
  *
+ * The abstract is printed here too: a reader who wants to check a claim AND see what the paper says it
+ * did used to need two invocations, and the second one had to repeat the identifier. The report is
+ * still a registry check - the abstract is the publisher's deposit, quoted, not a summary of the paper.
+ *
  * @param {object} work A normalized Crossref record.
  * @param {{checks: object[], retractions: object[], retracted: boolean}} verdict The comparison.
+ * @param {{abstractChars?: number}} [context] The abstract budget, the same one `--doi` takes.
  * @returns {string} The report.
  */
-export function formatVerify(work, verdict) {
+export function formatVerify(work, verdict, context = {}) {
   const lines = [
     'mode     : registry record (Crossref)',
     `doi      : ${work.doi || '(none)'}`,
@@ -827,6 +851,7 @@ export function formatVerify(work, verdict) {
   for (const update of verdict.retractions) {
     lines.push(`  notice : ${update.type} ${update.doi}${update.label ? ` - ${update.label}` : ''}`)
   }
+  lines.push(abstractLine(work, context.abstractChars ?? DEFAULT_ABSTRACT_CHARS))
   if (verdict.checks.length === 0) {
     lines.push('match    : no expectation was given; only existence and retraction were checked')
   } else {
@@ -1115,7 +1140,7 @@ async function main() {
       console.log(
         options.json
           ? JSON.stringify({ mode: 'verify', retrieved: today(), work, ...verdict }, null, 2)
-          : formatVerify(work, verdict),
+          : formatVerify(work, verdict, { abstractChars: options.abstractChars }),
       )
       return
     }

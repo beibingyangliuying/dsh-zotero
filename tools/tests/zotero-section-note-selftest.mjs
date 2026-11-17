@@ -1,10 +1,10 @@
 // The section-note tool's offline suite: identity is a tag, nothing is parsed from prose, and no
 // automatic prose repair exists. Runnable with no library and no authorization.
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { spawn, spawnSync } from 'node:child_process'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
   AGENT_TAG,
@@ -27,6 +27,7 @@ import {
   looksLikeHtml,
   markOutlineRows,
   normalizeSectionToken,
+  parseBatchManifest,
   planJson,
   provenanceOf,
   readSectionTag,
@@ -264,6 +265,54 @@ const planUnread = planJson({
 same(planUnread.outline.unavailable, 'the PDF engine is not installed', 'an outline that could not be read keeps its reason')
 same(planJson({ record: { key: 'REC1', itemType: 'journalArticle' }, attachment: null, notes: [] }).outline, null, 'a record with no file carries no outline')
 
+console.log('\n[6d] a batch manifest says what each note is about')
+const manifestBase = resolve('manifest-base')
+const batchEntries = parseBatchManifest(
+  JSON.stringify([
+    { item: ' REC2 ', section: ' 4 ', file: 'notes/n4.html', replaces: ' OLD4 ', acknowledgeUnknown: ' read UNK ' },
+    { item: 'REC2', section: '5', text: '<p>第5节</p>' },
+  ]),
+  { baseDir: manifestBase },
+)
+same(batchEntries.length, 2, 'every entry is read, in manifest order')
+same(batchEntries[0].item, 'REC2', 'the record key is trimmed')
+same(batchEntries[0].section, '4', 'and so is the ordinal')
+same(batchEntries[0].file, resolve(manifestBase, 'notes/n4.html'), 'a relative body path resolves against the manifest')
+same(batchEntries[0].text, '', 'an entry names one body, so the other slot is empty')
+same(batchEntries[0].replaces, 'OLD4', 'a replacement is carried')
+same(batchEntries[0].acknowledgeUnknown, 'read UNK', 'and so is the sentence that acknowledges unread notes')
+same(batchEntries[1].text, '<p>第5节</p>', 'an inline body is carried as written')
+const manifestError = (json, label) => refused(() => parseBatchManifest(json), label)
+check(/not JSON/.test(manifestError('{', 'broken JSON is refused')), 'broken JSON is a usage error, not a crash')
+check(/one JSON array/.test(manifestError('{"item":"R"}', 'an object manifest is refused')), 'the manifest is an array, not one entry')
+check(/no entries/.test(manifestError('[]', 'an empty manifest is refused')), 'an empty manifest refuses rather than doing nothing')
+check(/entry 1 is not an object/.test(manifestError('[1]', 'a non-object entry is refused')), 'each entry is an object')
+check(
+  /carries title/.test(manifestError('[{"item":"R","section":"2","file":"n.html","title":"x"}]', 'an unknown key is refused')),
+  'an entry key the tool does not read is refused, so a typo cannot drop a body',
+)
+check(/has no "item"/.test(manifestError('[{"section":"2","file":"n.html"}]', 'a missing item is refused')), 'an entry names its record')
+check(/has no "section"/.test(manifestError('[{"item":"R","file":"n.html"}]', 'a missing section is refused')), 'and its section')
+check(
+  /exactly one of "text" and "file"/.test(manifestError('[{"item":"R","section":"2"}]', 'an entry with no body is refused')),
+  'an entry carries a body',
+)
+check(
+  /exactly one of "text" and "file"/.test(
+    manifestError('[{"item":"R","section":"2","text":"<p>x</p>","file":"n.html"}]', 'two bodies are refused'),
+  ),
+  'and only one',
+)
+check(
+  /repeats R §2/.test(
+    manifestError(
+      '[{"item":"R","section":"2","file":"a.html"},{"item":"R","section":"2","text":"<p>x</p>"}]',
+      'a repeated section is refused',
+    ),
+  ),
+  'writing one section twice in one batch is refused, because it is a mistake',
+)
+
 console.log('\n[7] the tool still says what it is doing')
 const source = readFileSync(fileURLToPath(new URL('../zotero-section-note.mjs', import.meta.url)), 'utf8')
 check(source.includes('REFUSED: §'), 'the refusal names the section it refuses')
@@ -290,6 +339,8 @@ same(run('--delete', '--note', 'X', '--reason', 'why').status, 2, '--delete does
 same(run('--tidy', '--note', 'X').status, 2, '--tidy is gone')
 same(run('--title', 'X').status, 2, '--title is gone: a note has no title field')
 same(run('--acknowledge-unknown', 'x').status, 2, '--acknowledge-unknown belongs to a --section create')
+same(run('--batch', 'm.json', '--item', 'REC2').status, 2, '--batch carries its own item per entry: it does not take --item')
+same(run('--batch', 'm.json', '--plan').status, 2, 'nor the single-record --plan')
 
 console.log('\n[9] the command line against a stub library, not the owner\'s')
 const stubItems = {
@@ -693,6 +744,63 @@ const unclaimUnconfirmed = await runAsync(['--unclaim', '--note', 'AMB2', '--sec
 same(unclaimUnconfirmed.status, 3, 'a tag removal that is accepted but does not read back is exit 3')
 check(unclaimUnconfirmed.stderr.includes('WRITTEN BUT UNCONFIRMED'), 'and it never says nothing was written', unclaimUnconfirmed.stderr)
 check(unclaimUnconfirmed.stderr.includes('still carries /section-5'), 'the mismatch names the tag that is still there', unclaimUnconfirmed.stderr)
+
+console.log('\n[9c] a batch is the same channel with the process started once')
+const batchDir = join(scratch, 'batch')
+mkdirSync(join(batchDir, 'notes'), { recursive: true })
+writeFileSync(join(batchDir, 'notes', 'n4.html'), '<p>第4节的内容</p>', 'utf8')
+const batchManifest = join(batchDir, 'manifest.json')
+writeFileSync(
+  batchManifest,
+  JSON.stringify([
+    { item: 'REC2', section: '4', file: 'notes/n4.html' },
+    { item: 'REC2', section: '5', text: '<p>第5节的内容</p>' },
+  ]),
+  'utf8',
+)
+const postsBefore = requests.filter((line) => line.startsWith('POST ')).length
+const missingManifest = await runAsync(['--batch', join(batchDir, 'no-such.json')])
+same(missingManifest.status, 2, 'a manifest that is not there is a usage error, not a stack trace')
+check(missingManifest.stderr.includes('could not be read'), 'naming the file it could not read', missingManifest.stderr)
+const batchDry = await runAsync(['--batch', batchManifest])
+same(batchDry.status, 0, 'a batch dry run exits 0 when every entry is planned')
+check(batchDry.stdout.includes('batch   : 2 entries'), 'and says how many entries it read', batchDry.stdout)
+check(batchDry.stdout.includes('--- 1/2  REC2  §4') && batchDry.stdout.includes('--- 2/2  REC2  §5'), 'planning each entry in turn')
+check(batchDry.stdout.includes('DRY RUN'), 'with the same dry-run sentence a single --section prints')
+same(requests.filter((line) => line.startsWith('POST ')).length, postsBefore, 'and sending no write')
+
+const batchWrite = await runAsync(['--batch', batchManifest, '--write'])
+same(batchWrite.status, 0, 'a batch write exits 0 when every entry reads back')
+check(batchWrite.stdout.includes('batch   : 2 of 2 written and read back'), 'and counts what it actually read back', batchWrite.stdout)
+const rec2Notes = childKeys.REC2.map((key) => stubItems[key])
+check(
+  rec2Notes.some((item) => item.tags.some((tag) => tag.tag === '/section-4')) &&
+    rec2Notes.some((item) => item.tags.some((tag) => tag.tag === '/section-5')),
+  'both notes carry the claims the manifest named',
+)
+
+const stopManifest = join(batchDir, 'stop.json')
+writeFileSync(
+  stopManifest,
+  JSON.stringify([
+    { item: 'REC2', section: '6', text: '<p>第6节</p>' },
+    { item: 'REC5', section: '2', text: '<p>重复的第二节</p>' },
+  ]),
+  'utf8',
+)
+const stopDry = await runAsync(['--batch', stopManifest])
+same(stopDry.status, 1, 'the same manifest refuses at the same entry on a dry run, before any write')
+check(stopDry.stdout.includes('stopped at entry 2 of 2 (exit 1)'), 'and stops there rather than planning the rest', stopDry.stdout)
+const batchStop = await runAsync(['--batch', stopManifest, '--write'])
+same(batchStop.status, 1, 'a batch stops with the code of the entry it could not confirm')
+check(batchStop.stdout.includes('done    : REC2 §6'), 'listing what was already written', batchStop.stdout)
+same(
+  childKeys.REC5
+    .map((key) => stubItems[key])
+    .filter((item) => (item.tags ?? []).some((tag) => tag.tag === '/section-2')).length,
+  1,
+  'and the refused entry wrote nothing, even though the entry before it did',
+)
 
 console.log('\n[10] a repair corrects a record in place, and a substantive one drops the acceptance')
 const typoBody = join(scratch, 'typo.html')

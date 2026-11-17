@@ -26,6 +26,7 @@ import {
   collectionKeyProblems,
   crossrefRefusal,
   emptyFieldNames,
+  isInitialsOnly,
   matchingRecord,
   parseCollectionKeys,
   splitWholeName,
@@ -194,6 +195,11 @@ console.log('\n[7b] a name that arrived whole, and the fields that arrived empty
 
 const split = splitWholeName({ family: 'Deyu Cai' })
 check(split.lastName === 'Cai' && split.firstName === 'Deyu', 'one whole name is split with the last word as the family name', `${split.firstName} | ${split.lastName}`)
+check(isInitialsOnly('F.'), 'a single initial is recognised')
+check(isInitialsOnly('F. X.'), 'and so is a run of them')
+check(!isInitialsOnly('Nicolás'), 'a spelled-out given name is not an initial')
+check(!isInitialsOnly(''), 'and an empty field is not one either')
+check(!isInitialsOnly('J.-P.'), 'a hyphenated pair is left alone rather than guessed at')
 const both = splitWholeName({ given: 'Ashish', family: 'Vaswani' })
 check(both.firstName === 'Ashish' && both.lastName === 'Vaswani', 'a name with both slots is left alone')
 check(splitWholeName({ family: 'Vaswani' }).lastName === 'Vaswani', 'a single word has no split to make')
@@ -237,7 +243,12 @@ const arxivXml =
 const crossrefRecord = {
   message: {
     title: ['Seismic fragility of &amp; substations'],
-    author: [{ given: 'Nicolás', family: 'Ahumada' }, { family: 'Deyu Cai' }, { name: 'IEEE Power Group' }],
+    author: [
+      { given: 'Nicolás', family: 'Ahumada' },
+      { family: 'Deyu Cai' },
+      { name: 'IEEE Power Group' },
+      { given: 'F.', family: 'Capitanescu' },
+    ],
     abstract: '<jats:p>Fragility &amp; short circuit faults.</jats:p>',
     issued: { 'date-parts': [[2026]] },
     'container-title': ['Reliability Engineering &amp; System Safety'],
@@ -515,6 +526,11 @@ check(!crossref.stdout.includes('&amp;'), 'and no entity survives into the plan'
 check(crossref.stdout.includes('Fragility & short circuit faults.'), 'nor into the abstract, whose markup tags are dropped')
 check(crossref.stdout.includes('name ?'), 'a creator that arrived as one string is called out')
 check(crossref.stdout.includes('Cai, Deyu'), 'and split with the last word as the family name')
+check(
+  crossref.stdout.includes('carry initials only') && crossref.stdout.includes('Capitanescu, F.'),
+  'a creator the deposit spelled with initials is called out, so "F." is not read as a full given name',
+  crossref.stdout,
+)
 check(crossref.stdout.includes('type ?'), 'and a deposit that carries an ISBN is called out as possibly a conference paper')
 check(crossref.stdout.includes('--item-type conferencePaper'), 'and the way to act on that is spelled out')
 check(crossref.stdout.includes('empty     : '), 'and the fields left empty are listed rather than implied')

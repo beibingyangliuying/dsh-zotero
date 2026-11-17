@@ -12,6 +12,7 @@
 //   * Unpaywall's 404 is HTML, byte-for-byte what the server sent. "not in this index", "the body is
 //     not JSON", "rate limited" and "the request failed" must never print the same thing.
 import {
+  abstractLine,
   boundedNotice,
   buildUrl,
   citeAccept,
@@ -22,6 +23,7 @@ import {
   formatOa,
   formatRefs,
   formatSearch,
+  formatVerify,
   formatWork,
   normalizeCrossrefWork,
   normalizeDoi,
@@ -425,6 +427,57 @@ throws('--verify needs a DOI, not an OpenAlex id', () => parseArgs(['--verify', 
 throws('an expectation outside --verify is refused', () => parseArgs(['--doi', '10.1000/x', '--expect-year', '2020']))
 throws('--source does not apply to --verify', () => parseArgs(['--verify', '10.1000/x', '--source', 'openalex']))
 throws('--source does not apply to --related', () => parseArgs(['--related', 'W123', '--source', 'crossref']))
+
+// --- one call answers "does the registry agree" and "what does it say" ------------------------------
+
+console.log('\n[12] a verification report carries the abstract, so one call answers both questions')
+
+const DEPOSITED = normalizeCrossrefWork({
+  DOI: '10.1000/y',
+  title: ['A deposited example'],
+  author: [{ given: 'Ada', family: 'Lovelace' }],
+  issued: { 'date-parts': [[2021]] },
+  abstract: '<jats:p>We measure &amp; report one thing.</jats:p>',
+})
+const depositedReport = formatVerify(DEPOSITED, verifyWork(DEPOSITED, { year: 2021 }))
+check(
+  depositedReport.includes('abstract : We measure & report one thing.'),
+  'the abstract is printed, decoded, and without its markup',
+  depositedReport,
+)
+check(
+  depositedReport.indexOf('abstract :') < depositedReport.indexOf('match    :'),
+  'after the identity and the retraction verdict, before the comparisons',
+  depositedReport,
+)
+const noAbstract = normalizeCrossrefWork({ DOI: '10.1000/z', title: ['No abstract'] })
+check(
+  formatVerify(noAbstract, verifyWork(noAbstract)).includes(
+    'abstract : (absent in this record - do not write one from the title)',
+  ),
+  'a record with no deposit says so, instead of leaving the reader to guess',
+)
+check(
+  abstractLine(DEPOSITED, 0) ===
+    `abstract : [omitted by --abstract 0; ${DEPOSITED.abstract.length} characters available from this record]`,
+  '--abstract 0 still says how much is available',
+)
+check(
+  abstractLine(DEPOSITED, 12).includes('characters held back; --abstract'),
+  'a budget shorter than the text says what it held back',
+)
+const rebuilt = normalizeOpenAlexWork({ id: 'https://openalex.org/W9', abstract_inverted_index: { one: [0], two: [1] } })
+check(abstractLine(rebuilt).includes('[rebuilt from abstract_inverted_index]'), 'a rebuilt abstract is marked as rebuilt')
+check(
+  abstractLine(normalizeOpenAlexWork({ id: 'https://openalex.org/W9' })).includes(
+    'OpenAlex ships only abstract_inverted_index',
+  ),
+  'and its absence names that index rather than blaming the record',
+)
+check(
+  parseArgs(['--verify', '10.1000/x', '--abstract', '0']).abstractChars === 0,
+  '--verify takes the same abstract budget as --doi',
+)
 
 console.log(`\n${failures === 0 ? 'PASS' : `FAIL (${failures})`}`)
 export const failedChecks = failures > 0

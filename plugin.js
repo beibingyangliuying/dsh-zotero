@@ -83,7 +83,7 @@ const CATALOG = [
   {
     program: 'zotero-section-note',
     purpose:
-      'one explanation note per top-level section: a coverage plan that names each section by the title the file itself carries, claim, rewrite, retire; writes need --write',
+      'one explanation note per top-level section: a coverage plan that names each section by the title the file itself carries, claim, rewrite, retire, and a manifest that writes many sections in one run; writes need --write',
     example: ['--item', 'ABCD1234'],
   },
   {
@@ -93,7 +93,7 @@ const CATALOG = [
   },
   {
     program: 'metadata',
-    purpose: 'bibliographic REST over OpenAlex/Crossref/Unpaywall: identifiers, search, references, citations, open-access lookup, citation formatting',
+    purpose: 'bibliographic REST over OpenAlex/Crossref/Unpaywall: identifiers, search, references, citations, open-access lookup, citation formatting, and a registry check that also quotes the deposited abstract',
     example: ['--doi', '10.1038/s41586-021-03819-2'],
   },
   {

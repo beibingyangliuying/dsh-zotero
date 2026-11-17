@@ -365,12 +365,14 @@ async function metadataFromCrossref(doi) {
   // `family`, and a journal article that is really a conference paper. None of that is an error to
   // refuse, so each is repaired (or named) here and the plan says what it did.
   const wholeNames = []
+  const initialNames = []
   const creators = (m.author ?? []).map((a) => {
     if (a.name) return { creatorType: 'author', name: decodeEntities(a.name) }
     const { firstName, lastName } = splitWholeName(a)
     if (String(a.given ?? '').trim() === '' && /\s/.test(String(a.family ?? '').trim())) {
       wholeNames.push(`${lastName}, ${firstName}`)
     }
+    if (isInitialsOnly(a.given)) initialNames.push([lastName, firstName].filter(Boolean).join(', '))
     return { creatorType: 'author', firstName, lastName }
   })
   const warnings = []
@@ -378,6 +380,12 @@ async function metadataFromCrossref(doi) {
     warnings.push(
       `name ? : ${wholeNames.length} creator(s) arrived as one string (${wholeNames.join(' · ')}); the last word was ` +
         'taken as the family name — check the order before citing it',
+    )
+  }
+  if (initialNames.length) {
+    warnings.push(
+      `name ? : ${initialNames.length} creator(s) carry initials only (${initialNames.slice(0, 3).join(' · ')}); the ` +
+        'deposit does not spell those given names out, so check the author page before citing it',
     )
   }
   const looksConference =
@@ -423,6 +431,26 @@ export function splitWholeName(creator) {
   if (given !== '' || !/\s/.test(family)) return { firstName: given, lastName: family }
   const words = family.split(/\s+/)
   return { firstName: words.slice(0, -1).join(' '), lastName: words.at(-1) }
+}
+
+/**
+ * Whether a deposit wrote a given name as initials only.
+ *
+ * `F. Capitanescu` is a complete creator record whose given name cannot be expanded from anything this
+ * channel carries: Crossref sends what the publisher deposited. The value of saying so is that a reader
+ * knows the record is thin here rather than thinking `F.` is the author's full name - so the hint is
+ * printed as a question (`name ?`), never as a refusal and never as a guess.
+ *
+ * @param {unknown} given The `given` field as Crossref sent it.
+ * @returns {boolean} True when every token is a single letter with an optional stop.
+ */
+export function isInitialsOnly(given) {
+  const text = String(given ?? '').trim()
+  if (text === '') return false
+  return text
+    .split(/\s+/)
+    .filter(Boolean)
+    .every((token) => /^\p{Lu}\.?$/u.test(token))
 }
 
 /** Fields a payload carries but a reader does not fill; they are not "empty", they are structural. */
