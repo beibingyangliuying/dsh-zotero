@@ -338,14 +338,19 @@ export function resolveAction(options) {
     options.restore.length > 0 ? 'restore' : '',
     options.note ? 'note' : '',
     options.purgeTags.length > 0 ? 'purge' : '',
+    options.delete ? 'delete' : '',
   ].filter(Boolean)
   if (chosen.length === 0) {
     throw new UsageError(
-      'pass one action: --set/--set-creators/--add-tag/--remove-tag, --restore, --note with --text, or --purge-tag',
+      'pass one action: --set/--set-creators/--add-tag/--remove-tag, --restore, --delete, --note with --text, or --purge-tag',
     )
   }
   if (chosen.length > 1) throw new UsageError(`pass ONE action, not ${chosen.join(' + ')}`)
   const [action] = chosen
+  if (action === 'delete') {
+    if (options.items.length !== 1) throw new UsageError('--delete removes one record: pass ONE --item <key>')
+    return action
+  }
   if (action === 'edit' && options.items.length === 0) throw new UsageError('pass --item <key>')
   if (action !== 'edit' && options.items.length > 0) throw new UsageError(`--item does not apply to --${action}`)
   if (action === 'note' && options.text === null) throw new UsageError('pass --text <html> with --note <key>')
@@ -357,12 +362,15 @@ const USAGE =
   'usage: node tools/zotero-edit.mjs --item <key[,key...]> [--set field=value ...] [--add-tag T] [--remove-tag T] [--write]\n' +
   '       node tools/zotero-edit.mjs --item <itemKey> --set-creators "<type>: Last, First; ..." [--write]\n' +
   '       node tools/zotero-edit.mjs --restore <key[,key...]> [--write]\n' +
+  '       node tools/zotero-edit.mjs --item <itemKey> --delete [--write]\n' +
   '       node tools/zotero-edit.mjs --note <key> --text <html> [--write]\n' +
   '       node tools/zotero-edit.mjs --purge-tag <tag> [--write]\n' +
   `       editable fields: ${EDITABLE_FIELDS.join(', ')}\n` +
   '       --set-creators states the WHOLE creator list, in order: a comma ends the family name, a\n' +
   '       line with no comma is a single-field name, a leading type defaults to author, and "" clears\n' +
-  '       the list. It applies to one record, because a list replaced per record is not one change.'
+  '       the list. It applies to one record, because a list replaced per record is not one change.\n' +
+  '       --delete removes one record together with everything filed under it; the version is read\n' +
+  '       first, so a record that changed since this plan was printed is a conflict, not a delete.'
 
 function parseArgs(argv) {
   const options = {
@@ -372,6 +380,7 @@ function parseArgs(argv) {
     add: [],
     remove: [],
     write: false,
+    delete: false,
     restore: [],
     note: '',
     text: null,
@@ -392,6 +401,10 @@ function parseArgs(argv) {
     const flag = argv[index]
     if (flag === '--write') {
       options.write = true
+      continue
+    }
+    if (flag === '--delete') {
+      options.delete = true
       continue
     }
     if (!valued.includes(flag)) throw new UsageError(`unrecognised argument '${flag}'`)
@@ -823,6 +836,86 @@ async function runPurge(options, gate) {
   process.exitCode = 1
 }
 
+/**
+ * Plan and, with `write`, delete one record and everything filed under it.
+ *
+ * A DELETE needs the version precondition the other writes do, so the version is read first and sent
+ * with it: a record that changed in between answers 412, which is a conflict to re-plan, not a delete
+ * that may have happened. The deletion is read back rather than trusted, because "the delete answered
+ * 204" and "the record is gone" are different facts.
+ *
+ * @param {object} options Parsed flags.
+ * @param {object} gate The opened write gate.
+ * @returns {Promise<void>} Sets `process.exitCode`.
+ */
+async function runDelete(options, gate) {
+  const key = options.items[0]
+  let record
+  try {
+    record = await readItem(key)
+  } catch (error) {
+    console.error(`item ${key}: ${error.message}`)
+    process.exitCode = 1
+    return
+  }
+  const children = await childrenOf(key).catch(() => [])
+  console.log(`\nitem    : ${key}  [${record.itemType}]  "${record.title ?? ''}"`)
+  console.log(`version : ${record.version}`)
+  if (children.length) {
+    console.log(`children: ${children.length} node(s) go with it`)
+    for (const child of children.slice(0, 10)) {
+      console.log(`  ${child.key}  ${child.data?.itemType ?? ''}  ${child.data?.title ?? ''}`)
+    }
+  }
+  const path = `/api/users/0/items/${key}`
+  console.log(`write   : DELETE ${path}  If-Unmodified-Since-Version: ${record.version}`)
+  if (!options.write) {
+    console.log('\nDRY RUN - nothing was written. Re-run with --write to delete this record.')
+    return
+  }
+  if (isDeleted(record.deleted)) {
+    console.log('\nALREADY IN THE TRASH: nothing to delete.')
+    return
+  }
+  writeAttempted = true
+  const res = await gate.write('DELETE', path, undefined, {
+    'If-Unmodified-Since-Version': String(record.version),
+  })
+  if (res.status === 412) {
+    console.error(`\nCONFLICT: item ${key} changed since this plan was read. Nothing was deleted. Read it again.`)
+    process.exitCode = 1
+    return
+  }
+  if (isWriteAccepted(res.status)) {
+    let after = null
+    try {
+      after = await readItem(key)
+    } catch (error) {
+      if (error?.status !== 404) throw error
+    }
+    if (after !== null && !isDeleted(after.deleted)) {
+      process.exitCode = reportUnconfirmed({
+        key,
+        what: `the delete answered HTTP ${res.status} but the record still reads back`,
+        found: 'Read the record before deleting again.',
+      })
+      return
+    }
+    console.log(`\nOK - ${key} is gone (HTTP ${res.status}).`)
+    return
+  }
+  if (mayHaveLanded(res.status)) {
+    process.exitCode = reportUnconfirmed({
+      key,
+      what: `the delete answered HTTP ${res.status}`,
+      found: 'The record may already be gone; read it before deleting again.',
+    })
+    return
+  }
+  console.error(`\nThe library refused the delete (HTTP ${res.status}): ${res.text.slice(0, 300)}`)
+  process.exitCode = 1
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2))
   const action = resolveAction(options)
@@ -831,6 +924,7 @@ async function main() {
   console.log(`library : Zotero ${info.version} · server ${info.id}`)
   if (action === 'edit') return runEdit(options, gate)
   if (action === 'restore') return runRestore(options, gate)
+  if (action === 'delete') return runDelete(options, gate)
   if (action === 'note') return runNote(options, gate)
   return runPurge(options, gate)
 }

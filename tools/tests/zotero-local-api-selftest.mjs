@@ -23,6 +23,8 @@ import { createServer } from 'node:http'
 import { readFileSync } from 'node:fs'
 import {
   APP_NAME,
+  AUTHORIZE_TIMEOUT_MS,
+  createdItemKey,
   createWriteGate,
   emptyGrantStore,
   grantFilePath,
@@ -373,6 +375,43 @@ check(
 check((wired?.message ?? '').includes(String(closedPort)), 'and names the address it tried', firstLine(wired?.message ?? ''))
 if (originalAddress === undefined) delete process.env.ZOTERO_LOCAL_API
 else process.env.ZOTERO_LOCAL_API = originalAddress
+
+console.log('\n[13] the key a create answers with, in the shape it came in')
+
+check(
+  createdItemKey({ successful: { 0: { key: 'ABCD1234', version: 7, data: {} } }, success: { 0: 'ABCD1234' } }) === 'ABCD1234',
+  'an array POST is read from the saved object',
+)
+check(createdItemKey({ success: { 0: 'WXYZ9876' } }) === 'WXYZ9876', 'a single-object POST is read from the bare key')
+check(createdItemKey({ successful: { 0: { key: 'OBJ1' } } }) === 'OBJ1', 'either half alone is enough')
+check(createdItemKey({}) === '', 'an answer that names no key is empty, not undefined')
+check(createdItemKey(null) === '', 'and a body that never parsed does not throw')
+
+console.log('\n[14] a dialog nobody answered is a sentence, not a hang')
+
+const waited = []
+const silentTransport = {
+  serverInfo: async () => ({ id: 'srv1', version: 'test' }),
+  localRequest: async (method, path, options = {}) => {
+    if (path !== '/api/local/authorize') return { status: 200, headers: {}, text: '' }
+    waited.push(options.timeoutMs)
+    const error = new Error(`nothing answered within ${options.timeoutMs} ms`)
+    error.code = 'ETIMEDOUT'
+    throw error
+  },
+}
+const silentGate = createWriteGate({ appName: APP_NAME, store: memoryStore(), transport: silentTransport })
+await silentGate.open()
+let silentError = null
+try {
+  await silentGate.write('PATCH', '/api/users/0/items/AAAAAAAA', { title: 'x' })
+} catch (error) {
+  silentError = error
+}
+check(waited.length === 1 && waited[0] === AUTHORIZE_TIMEOUT_MS, 'the dialog is waited for with a finite ceiling', String(waited[0]))
+check(silentError?.refused === true, 'an unanswered dialog is a refusal, not an unknown outcome')
+check(/not answered within 120 s/.test(silentError?.message ?? ''), 'and the sentence says nobody answered it', firstLine(silentError?.message ?? ''))
+check(/answer the "Allow" dialog/.test(silentError?.message ?? ''), 'and what to do about it')
 
 console.log(`\n${failures === 0 ? 'PASS' : `FAIL (${failures})`}`)
 process.exit(failures === 0 ? 0 : 1)

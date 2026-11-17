@@ -25,12 +25,15 @@ import { fileURLToPath } from 'node:url'
 import {
   collectionKeyProblems,
   crossrefRefusal,
+  emptyFieldNames,
   matchingRecord,
   parseCollectionKeys,
+  splitWholeName,
   unfiledCollections,
   unknownCollections,
   withCollections,
 } from '../zotero-write.mjs'
+import { decodeEntities } from '../markup.mjs'
 
 let failures = 0
 const check = (condition, label, detail = '') => {
@@ -187,6 +190,26 @@ check(
   'the resolver sends the normalized DOI and refuses through that helper',
 )
 
+console.log('\n[7b] a name that arrived whole, and the fields that arrived empty')
+
+const split = splitWholeName({ family: 'Deyu Cai' })
+check(split.lastName === 'Cai' && split.firstName === 'Deyu', 'one whole name is split with the last word as the family name', `${split.firstName} | ${split.lastName}`)
+const both = splitWholeName({ given: 'Ashish', family: 'Vaswani' })
+check(both.firstName === 'Ashish' && both.lastName === 'Vaswani', 'a name with both slots is left alone')
+check(splitWholeName({ family: 'Vaswani' }).lastName === 'Vaswani', 'a single word has no split to make')
+check(
+  splitWholeName({ given: 'Juan Carlos', family: 'de la Llera' }).lastName === 'de la Llera',
+  'a family name with spaces and a given name beside it is kept whole',
+)
+
+const empty = emptyFieldNames({ itemType: 'journalArticle', creators: [], title: 'A', DOI: '', volume: '', issue: '' })
+check(empty.join(', ') === 'DOI, volume, issue', 'the empty fields are named in payload order', empty.join(', '))
+check(emptyFieldNames({ itemType: 'note', title: '' }).includes('itemType') === false, 'and the record structure is not mistaken for a field')
+
+check(decodeEntities('Reliability Engineering &amp; System Safety') === 'Reliability Engineering & System Safety', 'the entity Crossref sends is decoded')
+check(decodeEntities('&#233;t&#xE9;') === 'été', 'and so is a numeric entity')
+check(decodeEntities('&unknown;') === '&unknown;', 'an entity this suite does not know is left as it was')
+
 console.log("\n[8] the command line against a stub library and a stub arXiv, not the owner's")
 
 const scratch = mkdtempSync(join(tmpdir(), 'write-cli-'))
@@ -211,6 +234,22 @@ const arxivXml =
   `<arxiv:doi>${arXivRecord.doi}</arxiv:doi>` +
   arXivRecord.creators.map((name) => `<name>${name}</name>`).join('') +
   '</entry></feed>'
+const crossrefRecord = {
+  message: {
+    title: ['Seismic fragility of &amp; substations'],
+    author: [{ given: 'Nicolás', family: 'Ahumada' }, { family: 'Deyu Cai' }, { name: 'IEEE Power Group' }],
+    abstract: '<jats:p>Fragility &amp; short circuit faults.</jats:p>',
+    issued: { 'date-parts': [[2026]] },
+    'container-title': ['Reliability Engineering &amp; System Safety'],
+    volume: '268',
+    page: '112001',
+    DOI: '10.29999/FIXTURE',
+    URL: 'https://example.org/fixture',
+    language: 'en',
+    ISSN: ['0951-8320'],
+    ISBN: ['978-1-0000-0000-0'],
+  },
+}
 writeFileSync(
   preload,
   [
@@ -219,6 +258,9 @@ writeFileSync(
     'globalThis.fetch = async (url, init) => {',
     '  if (String(url).includes("export.arxiv.org")) {',
     `    return new Response(${JSON.stringify(arxivXml)}, { status: 200, headers: { "content-type": "text/xml" } })`,
+    '  }',
+    '  if (String(url).includes("api.crossref.org")) {',
+    `    return new Response(${JSON.stringify(JSON.stringify(crossrefRecord))}, { status: 200, headers: { "content-type": "application/json" } })`,
     '  }',
     '  return realFetch(url, init)',
     '}',
@@ -255,6 +297,7 @@ const stub = {
   authorize: () => ({ status: 200, body: { key: 'stub-key', remember: false } }),
   createStatus: null,
   readBack: null,
+  fields: null,
 }
 
 const resetLibrary = () => {
@@ -264,6 +307,7 @@ const resetLibrary = () => {
   stub.authorize = () => ({ status: 200, body: { key: 'stub-key', remember: false } })
   stub.createStatus = null
   stub.readBack = null
+  stub.fields = null
 }
 
 const server = createServer((req, res) => {
@@ -296,7 +340,7 @@ const server = createServer((req, res) => {
     return
   }
   if (path === '/api/itemTypeFields') {
-    send(200, PREPRINT_FIELDS.map((field) => ({ field })))
+    send(200, (stub.fields ?? PREPRINT_FIELDS).map((field) => ({ field })))
     return
   }
   if (path === '/api/itemTypeCreatorTypes') {
@@ -456,6 +500,31 @@ const noSource = await runAsync(['--write'])
 // Exit 2, not 1: naming neither source is a malformed command line, and a caller that reads 1 would go
 // looking for a write that refused when the program never got as far as asking the library.
 check(noSource.status === 2, 'no --arxiv and no --doi is a usage error, and says so with exit 2', `status ${noSource.status}`)
+
+// The other resolver: a Crossref deposit carrying the things that used to reach the library raw - HTML
+// entities, a creator whose given and family came as one string, and an ISBN that marks a proceedings
+// deposit rather than the journal article the resolver would file it as.
+resetLibrary()
+// A journal article's own fields, so the plan can carry the container title the deposit names.
+stub.fields = ['title', 'abstractNote', 'date', 'publicationTitle', 'volume', 'issue', 'pages', 'DOI', 'url', 'language', 'ISSN']
+const crossref = await runAsync(['--doi', '10.29999/FIXTURE'])
+check(crossref.status === 0, 'a Crossref deposit the publisher marked up is read', `status ${crossref.status}`)
+check(crossref.stdout.includes('Seismic fragility of & substations'), 'and the title is decoded, not kept as &amp;', first(crossref.stdout))
+check(crossref.stdout.includes('Reliability Engineering & System Safety'), 'and so is the journal title')
+check(!crossref.stdout.includes('&amp;'), 'and no entity survives into the plan')
+check(crossref.stdout.includes('Fragility & short circuit faults.'), 'nor into the abstract, whose markup tags are dropped')
+check(crossref.stdout.includes('name ?'), 'a creator that arrived as one string is called out')
+check(crossref.stdout.includes('Cai, Deyu'), 'and split with the last word as the family name')
+check(crossref.stdout.includes('type ?'), 'and a deposit that carries an ISBN is called out as possibly a conference paper')
+check(crossref.stdout.includes('--item-type conferencePaper'), 'and the way to act on that is spelled out')
+check(crossref.stdout.includes('empty     : '), 'and the fields left empty are listed rather than implied')
+check(creates().length === 0, 'a dry run still wrote nothing')
+
+// The warning is only worth printing if there is a way to act on it, so the override must be legal.
+resetLibrary()
+const typed = await runAsync(['--doi', '10.29999/FIXTURE', '--item-type', 'conferencePaper'])
+check(typed.status === 0, '--item-type beside --doi overrides the type the source would pick', `status ${typed.status}`)
+check(typed.stdout.includes('conferencePaper'), 'and the plan is built for that type')
 
 server.close()
 

@@ -32,18 +32,20 @@
 //   node tools/zotero-link-attachments.mjs --target D:\Store --write
 //   node tools/zotero-link-attachments.mjs --target D:\Store --write --limit 5
 //   node tools/zotero-link-attachments.mjs --target D:\Store --no-wake --write
-import { createReadStream, existsSync, statSync, copyFileSync } from 'node:fs'
+import { createReadStream, existsSync, readFileSync, readdirSync, statSync, copyFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { APP_NAME, createWriteGate, getJson, isWriteAccepted, localRequest, mayHaveLanded, reportUnconfirmed } from './zotero-local-api.mjs'
+import { APP_NAME, createdItemKey, createWriteGate, getJson, isWriteAccepted, localRequest, mayHaveLanded, reportUnconfirmed } from './zotero-local-api.mjs'
 import { reportFailure, reportHelp, wantsHelp } from './refusal.mjs'
 
 const USAGE =
   'usage: node tools/zotero-link-attachments.mjs --target <directory> [--limit N] [--no-wake] [--write]\n' +
   '       node tools/zotero-link-attachments.mjs --selftest\n' +
   '       a dry run unless --write is given. Exit 3 means a link or a delete may have landed: read the\n' +
-  '       key it names before running the conversion again.'
+  '       key it names before running the conversion again. A destination outside Zotero\'s linked-\n' +
+  '       attachment base directory is reported, because Zotero stores that link as an absolute path\n' +
+  '       that stops resolving on another machine.'
 
 /** Set immediately before a write is sent, so a failure after that point is never called a refusal. */
 let writeAttempted = false
@@ -199,8 +201,7 @@ async function createLinked(parentKey, absolutePath, contentType, title) {
     { itemType: 'attachment', parentItem: parentKey, linkMode: 'linked_file', contentType, path: absolutePath, title },
   ])
   const body = res.status === 200 ? JSON.parse(res.text) : null
-  const saved = body?.successful?.['0'] ?? body?.success?.['0']
-  const key = typeof saved === 'string' ? saved : saved?.key
+  const key = createdItemKey(body)
   if (key) return key
   // No key: an answer that might have carried the request leaves the link possibly created, so the
   // caller looks for it rather than reporting a failure the next run would answer with a second link.
@@ -263,8 +264,7 @@ async function wakeIndexDrain() {
   const res = await gate.write('POST', '/api/users/0/items', [{ itemType: 'note', note: body }])
   if (res.status !== 200) return { key: null, created: false, status: res.status }
   const parsed = JSON.parse(res.text)
-  const saved = parsed.successful?.['0'] ?? parsed.success?.['0']
-  return { key: typeof saved === 'string' ? saved : saved?.key, created: true, status: res.status }
+  return { key: createdItemKey(parsed), created: true, status: res.status }
 }
 
 const argv = process.argv.slice(2)
@@ -272,6 +272,72 @@ const flag = (name) => argv.includes(`--${name}`)
 const value = (name) => {
   const index = argv.indexOf(`--${name}`)
   return index === -1 ? null : (argv[index + 1] ?? null)
+}
+
+/** Where Zotero keeps its profiles on this platform, as far as it can be guessed without the app. */
+function defaultProfileRoot() {
+  if (process.env.ZOTERO_PROFILE_DIR) return process.env.ZOTERO_PROFILE_DIR
+  if (process.env.APPDATA) return join(process.env.APPDATA, 'Zotero', 'Zotero')
+  if (process.env.HOME) return join(process.env.HOME, 'Library', 'Application Support', 'Zotero')
+  return ''
+}
+
+/**
+ * Zotero's linked-attachment base directory, when a profile records one.
+ *
+ * A linked file stored as an absolute path resolves only on this machine, so a link outside the base
+ * directory is the one that breaks when the library is copied elsewhere. The local API exposes no
+ * preference endpoint (`/api/users/0/settings` answers `{}`), so this reads the profile's `prefs.js`
+ * when it is there and says nothing when it is not: an unknown base is not a finding.
+ *
+ * @param {string} [profileRoot] The directory holding `Profiles/<name>/prefs.js`; defaults to this platform's.
+ * @returns {string} The configured directory, or '' when none could be read.
+ */
+export function baseAttachmentPath(profileRoot = defaultProfileRoot()) {
+  if (!profileRoot || !existsSync(profileRoot)) return ''
+  let names
+  try {
+    names = readdirSync(profileRoot)
+  } catch {
+    return ''
+  }
+  for (const name of names) {
+    const file = join(profileRoot, name, 'prefs.js')
+    if (!existsSync(file)) continue
+    let text
+    try {
+      text = readFileSync(file, 'utf8')
+    } catch {
+      continue
+    }
+    const found = /user_pref\("extensions\.zotero\.baseAttachmentPath"\s*,\s*("(?:[^"\\]|\\.)*")\s*\)/.exec(text)
+    if (!found) continue
+    try {
+      const value = JSON.parse(found[1])
+      if (value) return value
+    } catch {
+      // A prefs line that is not a JSON string is not a base path; keep looking.
+    }
+  }
+  return ''
+}
+
+/**
+ * Whether a path sits inside a directory, compared the way this platform's filesystem compares.
+ *
+ * @param {string} file An absolute path.
+ * @param {string} directory An absolute directory, or '' for "unknown", which answers true.
+ * @returns {boolean} True when `file` is inside `directory`.
+ */
+export function isUnderDirectory(file, directory) {
+  if (!directory) return true
+  const clean = (text) => resolve(text).replace(/\\/g, '/').replace(/\/+$/, '')
+  const inside = clean(directory)
+  const target = clean(file)
+  if (process.platform === 'win32') {
+    return target.toLowerCase() === inside.toLowerCase() || target.toLowerCase().startsWith(`${inside.toLowerCase()}/`)
+  }
+  return target === inside || target.startsWith(`${inside}/`)
 }
 
 async function planCandidates(targetDir) {
@@ -329,6 +395,8 @@ async function main() {
   console.log(`[1] Zotero ${info.version}, server ${info.id}, target ${targetDir}`)
 
   const { plans, skipped } = await planCandidates(targetDir)
+  // '' when no profile could be read; the plan then says nothing about the base directory at all.
+  const base = baseAttachmentPath()
   const pending = apply && limit > 0 ? plans.slice(0, limit) : plans
   console.log(
     `[2] candidates: ${plans.length} stored PDF(s); skipped ${skipped.linked} already linked, ` +
@@ -343,7 +411,17 @@ async function main() {
         : plan.action === 'redundant'
           ? '  (the item already links a file of that name)'
           : ''
-    console.log(`    ${plan.action.padEnd(14)} ${plan.key}  ${plan.destination}${detail}`)
+    // A link outside the base directory is stored as an absolute path: it works here and stops
+    // working on another machine, which is worth one phrase while the plan is still a plan.
+    const outside = base !== '' && !isUnderDirectory(plan.destination, base) ? '  (outside the base attachment directory)' : ''
+    console.log(`    ${plan.action.padEnd(14)} ${plan.key}  ${plan.destination}${detail}${outside}`)
+  }
+  if (base !== '') {
+    const outside = plans.filter((plan) => !isUnderDirectory(plan.destination, base)).length
+    if (outside) {
+      console.log(`    note          : ${outside} destination(s) sit outside ${base}; those links are absolute and`)
+      console.log('                    stop resolving when the library is opened on another machine')
+    }
   }
 
   if (plans.length === 0) {

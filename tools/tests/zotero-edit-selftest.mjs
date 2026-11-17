@@ -149,6 +149,7 @@ const baseRecord = () => ({
   tags: [{ tag: '/unread' }, { tag: '/keep' }],
   creators: [{ creatorType: 'author', lastName: 'Carlos de la Llera', firstName: 'Juan' }],
   version: 12,
+  deleted: false,
   collections: [],
 })
 
@@ -160,6 +161,7 @@ const stub = {
   authorize: () => ({ status: 200, body: { key: 'stub-key', remember: false } }),
   patchItem: null,
   creatorTypes: null,
+  deleteStatus: null,
 }
 
 const resetLibrary = () => {
@@ -168,6 +170,7 @@ const resetLibrary = () => {
   stub.authorize = () => ({ status: 200, body: { key: 'stub-key', remember: false } })
   stub.patchItem = null
   stub.creatorTypes = null
+  stub.deleteStatus = null
 }
 
 /** The library's own rule in miniature: honour the version precondition, then carry the change out. */
@@ -218,10 +221,32 @@ const server = createServer((req, res) => {
     else send(200, stub.creatorTypes.map((creatorType) => ({ creatorType })))
     return
   }
+  const childrenPath = /^\/api\/users\/0\/items\/([A-Z0-9]+)\/children$/.exec(path)
+  if (childrenPath) {
+    send(200, [])
+    return
+  }
   const itemPath = /^\/api\/users\/0\/items\/([A-Z0-9]+)$/.exec(path)
   if (itemPath) {
     if (itemPath[1] !== stub.record.key) {
       send(404, { error: 'not found' })
+      return
+    }
+    if (req.method === 'DELETE') {
+      if (stub.deleteStatus) {
+        send(stub.deleteStatus, { error: 'the stub refused the delete' })
+        return
+      }
+      const expected = req.headers['if-unmodified-since-version']
+      if (String(expected) !== String(stub.record.version)) {
+        send(412, { error: 'precondition failed' })
+        return
+      }
+      // The library's DELETE moves a record to the trash rather than removing it, which is why the
+      // tool has to read it back and look at `deleted` rather than at the empty answer.
+      stub.record.deleted = true
+      stub.record.version += 1
+      noContent()
       return
     }
     if (req.method === 'PATCH') {
@@ -526,6 +551,42 @@ check([...trashRows.values()].every((row) => !isDeleted(row.deleted)), 'every tr
 const restoreAgain = await runTrash(['--restore', 'PARENT01', '--write'])
 check(restoreAgain.status === 0 && restoreAgain.stdout.includes('Nothing to restore'), 'a live graph is already present, not rewritten')
 trashServer.close()
+
+// --delete reads the version before it offers to remove anything: that version is what makes the
+// delete safe against a record that changed while the plan was on screen.
+resetLibrary()
+const deletePlan = await runAsync(['--item', 'EDIT0001', '--delete'])
+check(deletePlan.status === 0, 'a delete dry run exits 0', `status ${deletePlan.status}`)
+check(deletePlan.stdout.includes('DELETE /api/users/0/items/EDIT0001'), 'and shows the request it would send')
+check(deletePlan.stdout.includes('If-Unmodified-Since-Version: 12'), 'with the version it just read', first(deletePlan.stdout))
+check(deletePlan.stdout.includes('DRY RUN'), 'and writes nothing')
+check(!stub.requests.some((line) => line.startsWith('DELETE ')), 'and no DELETE was sent', stub.requests.join(' '))
+
+resetLibrary()
+const deleted = await runAsync(['--item', 'EDIT0001', '--delete', '--write'])
+check(deleted.status === 0, 'a delete the library accepts exits 0', `status ${deleted.status}`)
+check(deleted.stdout.includes('OK - EDIT0001 is gone'), 'and says the record is gone', first(deleted.stdout))
+check(stub.record.deleted === true, 'and the stub library holds it in the trash')
+
+resetLibrary()
+stub.record.deleted = true
+const alreadyTrashed = await runAsync(['--item', 'EDIT0001', '--delete', '--write'])
+check(alreadyTrashed.status === 0, 'a record already in the trash exits 0', `status ${alreadyTrashed.status}`)
+check(alreadyTrashed.stdout.includes('ALREADY IN THE TRASH'), 'and says there is nothing to delete')
+check(!stub.requests.some((line) => line.startsWith('DELETE ')), 'and sends no DELETE')
+
+resetLibrary()
+stub.deleteStatus = 412
+const staleDelete = await runAsync(['--item', 'EDIT0001', '--delete', '--write'])
+check(staleDelete.status === 1, 'a record that changed since the plan is a conflict, not a delete', `status ${staleDelete.status}`)
+check(staleDelete.stderr.includes('CONFLICT'), 'and says so', first(staleDelete.stderr))
+check(stub.record.deleted === false, 'and nothing was deleted')
+
+// One record at a time: a comma-separated list would delete whatever the first key names, which is
+// the kind of quiet wrong record no dry run catches.
+const manyDelete = await runAsync(['--item', 'EDIT0001,EDIT0002', '--delete'])
+check(manyDelete.status === 2, '--delete with two keys is a usage error', `status ${manyDelete.status}`)
+check(manyDelete.stderr.includes('ONE --item'), 'and says to name one', first(manyDelete.stderr))
 
 server.close()
 

@@ -347,7 +347,10 @@ const server = createServer((req, res) => {
         parentItem: payload.parentItem,
       }
       childKeys[payload.parentItem] = [...(childKeys[payload.parentItem] ?? []), key]
-      send(200, { successful: { 0: key } })
+      // The two shapes the local API really answers with, in one body: `successful.0` is the saved
+      // object and `success.0` is the bare key. A fixture that returned only the string let a tool
+      // read the object as the key, and the bug it caused went unseen for every write it made.
+      send(200, { successful: { 0: { key, version: 10 + created, data: stubItems[key] } }, success: { 0: key } })
     })
     return
   }
@@ -499,6 +502,7 @@ check(acked.stdout.includes('/agent-note'), 'the create plan carries the agent m
 
 const createWrite = await runAsync(['--item', 'REC1', '--section', '7', '--file', createBody, '--acknowledge-unknown', 'read UNK and AGU; neither explains §7', '--write'])
 same(createWrite.status, 0, 'the acknowledged create writes')
+check(createWrite.stdout.includes('OK - note '), 'a write that reads back is reported as OK, not as an unknown outcome', createWrite.stdout)
 const createdKey = /note (NEW\d+) carries/.exec(createWrite.stdout)?.[1] ?? ''
 check(createdKey !== '', 'the created note is named by its key', createWrite.stdout)
 check(stubItems[createdKey]?.tags.some((tag) => tag.tag === '/agent-note'), 'and it reads back carrying /agent-note')

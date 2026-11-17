@@ -41,12 +41,12 @@ const CATALOG = [
   },
   {
     program: 'zotero-write',
-    purpose: 'add one item by DOI, arXiv id, or item type + fields, or add a note; optionally filing it into a collection; a dry run unless --write is given',
+    purpose: 'add one item by DOI, arXiv id, or item type + fields, or add a note; optionally filing it into a collection; --item-type beside --doi or --arxiv overrides the type the source would pick; a dry run unless --write is given',
     example: ['--doi', '10.1000/xyz', '--write'],
   },
   {
     program: 'zotero-edit',
-    purpose: "change fields, the whole creator list, or tags on one or more items; restore trashed items, rewrite a note, or delete library tags; a dry run unless --write is given",
+    purpose: "change fields, the whole creator list, or tags on one or more items; move one record to the trash, restore trashed items, rewrite a note, or delete library tags; a dry run unless --write is given",
     example: ['--item', 'ABCD1234', '--set', 'title=A new title', '--write'],
   },
   {
@@ -76,7 +76,7 @@ const CATALOG = [
   },
   {
     program: 'zotero-link-attachments',
-    purpose: 'convert stored PDFs into linked files under a target directory; a dry run unless --write is given',
+    purpose: 'convert stored PDFs into linked files under a target directory; reports a destination outside the base attachment directory; a dry run unless --write is given',
     example: ['--target', 'D:\\Store'],
   },
   {

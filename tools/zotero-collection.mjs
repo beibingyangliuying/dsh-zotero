@@ -49,6 +49,7 @@ import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   APP_NAME,
+  createdItemKey,
   createWriteGate,
   getJson,
   mayHaveLanded,
@@ -321,8 +322,7 @@ async function runCreate(options) {
     return
   }
   const body = res.status === 200 ? JSON.parse(res.text) : null
-  const saved = body?.successful?.['0'] ?? body?.success?.['0']
-  const created = typeof saved === 'string' ? saved : saved?.key
+  const created = createdItemKey(body)
   if (created) {
     const back = await readCollection(created)
     console.log(`\nOK - ${created} "${back.name}" now exists under ${parentName} (version ${back.version}).`)
@@ -566,8 +566,7 @@ async function runSavedSearchCreate(options) {
   const res = await gate.write('POST', '/api/users/0/searches', [body])
   if (res.status >= 200 && res.status < 300) {
     const parsed = JSON.parse(res.text || '{}')
-    const picked = parsed?.successful?.['0'] ?? parsed?.success?.['0']
-    const created = typeof picked === 'string' ? picked : picked?.key
+    const created = createdItemKey(parsed)
     if (created) {
       const back = await readSearch(created)
       if (back.name === body.name && sameConditions(body.conditions, back.conditions)) {

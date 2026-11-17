@@ -80,7 +80,7 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { UsageError, reportFailure, reportHelp, wantsHelp } from './refusal.mjs'
-import { APP_NAME, childrenOf, createWriteGate, isWriteAccepted, localRequest, patchItem, readItem, visibleText } from './zotero-local-api.mjs'
+import { APP_NAME, childrenOf, createdItemKey, createWriteGate, isWriteAccepted, localRequest, patchItem, readItem, visibleText } from './zotero-local-api.mjs'
 
 /** The tag prefix that records which top-level section a note explains. */
 export const SECTION_TAG_PREFIX = '/section-'
@@ -957,7 +957,7 @@ async function runCreate(options) {
     return
   }
   const saved = JSON.parse(res.text)
-  const noteKey = saved.successful?.['0'] ?? saved.success?.['0']
+  const noteKey = createdItemKey(saved)
   if (!noteKey) {
     let landed
     try {

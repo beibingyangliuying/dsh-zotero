@@ -64,6 +64,7 @@
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Refusal, UsageError, reportFailure, reportHelp, wantsHelp } from './refusal.mjs'
+import { decodeEntities } from './markup.mjs'
 
 const OPENALEX_URL = 'https://api.openalex.org'
 const CROSSREF_URL = 'https://api.crossref.org'
@@ -210,18 +211,6 @@ export function reconstructAbstract(index) {
     if (slots[position] === undefined) return ''
   }
   return slots.join(' ')
-}
-
-/** JATS markup and entities, which Crossref abstracts carry and a reader should not see. */
-function decodeEntities(text) {
-  const named = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' }
-  return String(text ?? '').replace(/&(#?[a-z0-9]+);/gi, (match, body) => {
-    if (body.startsWith('#')) {
-      const code = /^#x/i.test(body) ? Number.parseInt(body.slice(2), 16) : Number(body.slice(1))
-      return Number.isFinite(code) ? String.fromCodePoint(code) : match
-    }
-    return named[body.toLowerCase()] ?? match
-  })
 }
 
 /**

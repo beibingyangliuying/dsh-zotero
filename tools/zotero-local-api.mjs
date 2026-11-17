@@ -103,6 +103,24 @@ export function collectionRef(key, library = PERSONAL_LIBRARY) {
 }
 
 /**
+ * The key a create answered with, whichever of the two shapes it used.
+ *
+ * The local API answers an array POST with `successful: {"0": {key, version, data}}` and a
+ * single-object POST with `success: {"0": "<key>"}`. A caller that reads one shape as the other gets
+ * an object where it expects a key, and then builds `/items/[object Object]` - a request path with a
+ * space in it, which the transport refuses. That mistake was made once; this function is where it
+ * cannot be made again.
+ *
+ * @param {unknown} body The parsed answer of a create.
+ * @returns {string} The new key, or '' when the answer named none.
+ */
+export function createdItemKey(body) {
+  const saved = body?.successful?.['0'] ?? body?.success?.['0']
+  if (typeof saved === 'string') return saved
+  return saved?.key ?? ''
+}
+
+/**
  * The filesystem path behind a `file://` location, or '' when it is not a file URL.
  *
  * The local API answers an attachment read with a redirect to `file:///C:/...`; the path is what a
@@ -324,6 +342,15 @@ const RETRY_DELAYS_MS = [200, 600, 1500, 2500, 4000]
  */
 const RETRYABLE_CODES = new Set(['ECONNRESET', 'ECONNABORTED', 'EPIPE'])
 
+/**
+ * How long an authorization request waits for the owner to answer the dialog.
+ *
+ * The request blocks until the dialog is answered, and the owner may have walked away: an unanswered
+ * dialog used to mean a caller that never returned and printed nothing. Two minutes is long enough to
+ * switch windows and click, and short enough that a session notices it was waiting for a person.
+ */
+export const AUTHORIZE_TIMEOUT_MS = 120_000
+
 const noop = () => {}
 
 /** Wait `ms` without a timer object to clean up. */
@@ -408,10 +435,11 @@ function exhaustedRead(method, error) {
 /**
  * Exactly one request, with no attempt to retry it.
  *
- * `timeoutMs` exists for a PROBE and is `0` for everything else. An authorization request BLOCKS until
- * the owner answers a dialog, so giving it a timeout is how a legitimate write gets reported as a
- * failure; a caller deciding "is anything listening on this address" is the opposite case, and must not
- * be able to hang on a socket that accepted a connection and then said nothing.
+ * `timeoutMs` exists for a PROBE and for the authorization dialog, and is `0` for everything else. An
+ * authorization request BLOCKS until the owner answers, so its ceiling is long (see
+ * {@link AUTHORIZE_TIMEOUT_MS}) and reaching it is reported as "nobody answered", never as a refusal
+ * from the library; a caller deciding "is anything listening on this address" is the opposite case, and
+ * must not be able to hang on a socket that accepted a connection and then said nothing.
  *
  * @param {string} method HTTP method.
  * @param {string} path Path beginning with `/api/`.
@@ -892,16 +920,28 @@ export function createWriteGate({
   let lasting = false
 
   async function authorize() {
-    const res = await transport.localRequest('POST', '/api/local/authorize', {
-      body: JSON.stringify({ appName }),
-      headers: { 'Content-Type': 'application/json', 'Zotero-Server-ID': serverId },
-    })
     // Every answer here arrives BEFORE the write is sent, so each one is a refusal in the sense the
     // exit codes use: nothing was written, and asking again is the right next step.
     const refusedError = (message) => {
       const error = new Error(message)
       error.refused = true
       return error
+    }
+    let res
+    try {
+      res = await transport.localRequest('POST', '/api/local/authorize', {
+        body: JSON.stringify({ appName }),
+        headers: { 'Content-Type': 'application/json', 'Zotero-Server-ID': serverId },
+        // The dialog is answered by a person. A ceiling turns a dialog nobody saw into a sentence
+        // saying so, instead of a caller that waits forever with nothing to read.
+        timeoutMs: AUTHORIZE_TIMEOUT_MS,
+      })
+    } catch (error) {
+      if (error?.code !== 'ETIMEDOUT') throw error
+      throw refusedError(
+        `the authorization dialog was not answered within ${Math.round(AUTHORIZE_TIMEOUT_MS / 1000)} s - ` +
+          'answer the "Allow" dialog in the reference manager, or run the command again when you are at the screen',
+      )
     }
     if (res.status === 403) throw refusedError('the authorization dialog was declined in the reference manager')
     if (res.status === 429) throw refusedError('too many authorization dialogs (limit 5/min) - wait a minute')

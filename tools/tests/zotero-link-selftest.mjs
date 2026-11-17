@@ -19,9 +19,11 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   WAKE_NOTE_MARKER,
+  baseAttachmentPath,
   classifyConflict,
   classifyDestination,
   destinationFor,
+  isUnderDirectory,
   sanitizeFilename,
   selectCandidates,
   summarize,
@@ -149,6 +151,31 @@ check(
   'the wake-note marker is a stable, searchable string',
   WAKE_NOTE_MARKER,
 )
+
+console.log('\n[2b] a destination outside the base attachment directory is named, not forbidden')
+
+const store = join(tmpdir(), 'store')
+check(isUnderDirectory(join(store, 'a.pdf'), store), 'a file inside the directory is inside it')
+check(isUnderDirectory(store, store), 'the directory itself is inside it')
+check(!isUnderDirectory(join(tmpdir(), 'elsewhere', 'a.pdf'), store), 'a sibling directory is not')
+check(!isUnderDirectory(join(tmpdir(), 'store-evil', 'a.pdf'), store), 'a name that merely starts the same is not')
+check(isUnderDirectory('/anywhere/a.pdf', ''), 'an unknown base forbids nothing, so it says nothing')
+if (process.platform === 'win32') {
+  check(isUnderDirectory('D:\\Store\\Sub\\a.pdf', 'd:\\store'), 'on Windows the comparison is Windows\'s: case-insensitive')
+}
+
+const profileRoot = mkdtempSync(join(tmpdir(), 'zotero-profile-'))
+mkdirSync(join(profileRoot, 'abc123.default'))
+writeFileSync(
+  join(profileRoot, 'abc123.default', 'prefs.js'),
+  'user_pref("extensions.zotero.baseAttachmentPath", "D:\\\\Store");\n',
+)
+check(baseAttachmentPath(profileRoot) === 'D:\\Store', 'the base directory is read from the profile', baseAttachmentPath(profileRoot))
+const noBase = mkdtempSync(join(tmpdir(), 'zotero-profile-empty-'))
+mkdirSync(join(noBase, 'x.default'))
+writeFileSync(join(noBase, 'x.default', 'prefs.js'), 'user_pref("extensions.zotero.useDataDir", true);\n')
+check(baseAttachmentPath(noBase) === '', 'a profile that does not record one answers empty')
+check(baseAttachmentPath(join(tmpdir(), 'no-such-profile')) === '', 'and so does a profile directory that is not there')
 
 console.log("\n[3] the command line against a stub library, not the owner's")
 
@@ -446,6 +473,26 @@ check(
   declined.stdout.trim().split(/\r?\n/).find((line) => line.includes('ERROR')) ?? '',
 )
 check(stub.items.STORED01 !== undefined, 'the stored attachment is still there')
+
+// The base directory comes from the profile, and a destination outside it is named and then allowed:
+// the owner may well mean to keep a file elsewhere, so this is a warning rather than a gate.
+const runProfile = mkdtempSync(join(tmpdir(), 'zotero-profile-run-'))
+mkdirSync(join(runProfile, 'run.default'))
+writeFileSync(
+  join(runProfile, 'run.default', 'prefs.js'),
+  'user_pref("extensions.zotero.baseAttachmentPath", "D:\\\\Store");\n',
+)
+process.env.ZOTERO_PROFILE_DIR = runProfile
+resetLibrary()
+const outsidePlan = await runAsync(['--target', storeDir])
+delete process.env.ZOTERO_PROFILE_DIR
+check(outsidePlan.status === 0, 'a destination outside the base directory is still planned', `status ${outsidePlan.status}`)
+check(outsidePlan.stdout.includes('(outside the base attachment directory)'), 'and the destination line says so')
+check(
+  outsidePlan.stdout.includes('stop resolving when the library is opened on another machine'),
+  'and the plan says what that costs',
+)
+check(createsSent() === 0, 'and it wrote nothing', `${createsSent()} create(s)`)
 
 server.close()
 

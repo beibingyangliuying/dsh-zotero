@@ -44,6 +44,8 @@ import { resolve as resolvePath } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   APP_NAME,
+  AUTHORIZE_TIMEOUT_MS,
+  createdItemKey,
   createWriteGate,
   getJson,
   localRequest,
@@ -54,6 +56,7 @@ import {
   serverInfo,
 } from './zotero-local-api.mjs'
 import { Refusal, UsageError, reportFailure, reportHelp, wantsHelp } from './refusal.mjs'
+import { decodeEntities } from './markup.mjs'
 // The identifiers are compared in the one form this preset already normalizes them into, so a DOI
 // written `https://doi.org/10.x/y` here and `10.x/y` there is the same work.
 import { normalizeTitle, sameDoi } from './zotero-read.mjs'
@@ -67,7 +70,9 @@ const USAGE =
   '       node tools/zotero-write.mjs --note <html> [--parent <key>] [--write]\n' +
   '       node tools/zotero-write.mjs --selftest\n' +
   '       a dry run unless --write is given; a record already in the library is left alone unless\n' +
-  '       --force is passed. Exit 3 means a record may exist: search for it before creating it again.'
+  '       --force is passed. Exit 3 means a record may exist: search for it before creating it again.\n' +
+  '       --item-type beside --doi or --arxiv overrides the type the source would pick, for a record a\n' +
+  '       publisher deposited as a journal article but issued as a conference paper.'
 
 /** Set immediately before the create is sent, so a failure after that point is never called a refusal. */
 let writeAttempted = false
@@ -354,17 +359,42 @@ async function metadataFromCrossref(doi) {
   if (!res.ok) throw crossrefRefusal(bare, res.status)
   const m = (await res.json()).message
   const date = m.issued?.['date-parts']?.[0] ?? []
+  const first = (list) => (Array.isArray(list) ? list[0] ?? '' : '')
+  const container = decodeEntities(first(m['container-title']))
+  // Crossref hands back the deposit as it was written: `&amp;` inside a title, a whole name inside
+  // `family`, and a journal article that is really a conference paper. None of that is an error to
+  // refuse, so each is repaired (or named) here and the plan says what it did.
+  const wholeNames = []
+  const creators = (m.author ?? []).map((a) => {
+    if (a.name) return { creatorType: 'author', name: decodeEntities(a.name) }
+    const { firstName, lastName } = splitWholeName(a)
+    if (String(a.given ?? '').trim() === '' && /\s/.test(String(a.family ?? '').trim())) {
+      wholeNames.push(`${lastName}, ${firstName}`)
+    }
+    return { creatorType: 'author', firstName, lastName }
+  })
+  const warnings = []
+  if (wholeNames.length) {
+    warnings.push(
+      `name ? : ${wholeNames.length} creator(s) arrived as one string (${wholeNames.join(' · ')}); the last word was ` +
+        'taken as the family name — check the order before citing it',
+    )
+  }
+  const looksConference =
+    Boolean(m.event?.name) || (m.ISBN?.length ?? 0) > 0 || /proceedings|conference|symposium|congress|workshop/i.test(container)
+  if (looksConference && value('item-type') === null) {
+    warnings.push(
+      `type ? : this reads like a conference paper (${m.event?.name ? `event "${m.event.name}"` : (m.ISBN?.length ?? 0) > 0 ? 'it carries an ISBN' : `the container is "${container}"`}); ` +
+        `re-run with --doi ${bare} --item-type conferencePaper to create it as one`,
+    )
+  }
   return {
     itemType: 'journalArticle',
-    title: (m.title ?? [])[0] ?? '',
-    creators: (m.author ?? []).map((a) =>
-      a.name
-        ? { creatorType: 'author', name: a.name }
-        : { creatorType: 'author', firstName: a.given ?? '', lastName: a.family ?? '' },
-    ),
-    abstractNote: (m.abstract ?? '').replace(/<[^>]+>/g, '').trim(),
+    title: decodeEntities(first(m.title)),
+    creators,
+    abstractNote: decodeEntities(String(m.abstract ?? '').replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim(),
     date: date.length ? date.join('-') : '',
-    publicationTitle: (m['container-title'] ?? [])[0] ?? '',
+    publicationTitle: container,
     volume: m.volume ?? '',
     issue: m.issue ?? '',
     pages: m.page ?? '',
@@ -372,7 +402,46 @@ async function metadataFromCrossref(doi) {
     url: m.URL ?? '',
     language: m.language ?? '',
     ISSN: (m.ISSN ?? []).join(', '),
+    warnings,
   }
+}
+
+/**
+ * Split a creator whose name arrived as one string, the way depositors sometimes send it.
+ *
+ * `family: "Deyu Cai"` with no `given` is one name written whole, not a two-word family name; the
+ * usual deposit convention is family-then-given, but a deposit that writes it whole is far more often
+ * given-then-family. Reading it verbatim puts the whole name in the family slot, which is what a
+ * citation then prints. A single word is left alone: it has no split to make.
+ *
+ * @param {{given?: string, family?: string}} creator One author as Crossref sent it.
+ * @returns {{firstName: string, lastName: string}} The two slots, with the last word as the family name.
+ */
+export function splitWholeName(creator) {
+  const given = String(creator?.given ?? '').trim()
+  const family = String(creator?.family ?? '').trim()
+  if (given !== '' || !/\s/.test(family)) return { firstName: given, lastName: family }
+  const words = family.split(/\s+/)
+  return { firstName: words.slice(0, -1).join(' '), lastName: words.at(-1) }
+}
+
+/** Fields a payload carries but a reader does not fill; they are not "empty", they are structural. */
+const STRUCTURAL_FIELDS = new Set(['itemType', 'creators', 'tags', 'collections', 'key', 'id', 'version', 'deleted'])
+
+/**
+ * The schema fields of a payload that carry nothing.
+ *
+ * A dry run that prints only what it filled hides what it could not fill, and a caller then reads an
+ * empty abstract as "the API has none" rather than "this record has none I could reach".
+ *
+ * @param {object} item The payload about to be written.
+ * @returns {string[]} Names of the empty string fields, in payload order.
+ */
+export function emptyFieldNames(item) {
+  return Object.entries(item)
+    .filter(([name, value]) => !STRUCTURAL_FIELDS.has(name) && (typeof value === 'string' || value == null))
+    .filter(([, value]) => String(value ?? '').trim() === '')
+    .map(([name]) => name)
 }
 
 /** Copy only the fields the item type actually accepts, so no invalid field is ever sent. */
@@ -473,9 +542,23 @@ function sourceFlags() {
   const present = []
   if (value('arxiv')) present.push('arxiv')
   if (value('doi')) present.push('doi')
-  if (value('item-type')) present.push('manual')
+  // `--item-type` on its own is a manual record. Beside --doi or --arxiv it overrides the type the
+  // source would pick, which is how a conference paper deposited as a journal article is created as
+  // one without retyping its fields by hand.
+  if (value('item-type') && !value('arxiv') && !value('doi')) present.push('manual')
   if (argv.includes('--note')) present.push('note')
   return present
+}
+
+/**
+ * The type the caller stated, applied to metadata a source fetched.
+ *
+ * @param {object} meta The record as the source described it.
+ * @returns {object} The same record, with `itemType` replaced when `--item-type` was passed.
+ */
+function withTypeOverride(meta) {
+  const type = value('item-type')
+  return type ? { ...meta, itemType: type } : meta
 }
 
 /** A manual record: the type plus the fields, creators and tags the caller stated. */
@@ -500,8 +583,12 @@ async function resolve() {
   }
   if (sources.length > 1) throw new UsageError(`pass ONE source, not ${sources.join(' + ')}`)
   const [source] = sources
-  if (source === 'arxiv') return { source: `arXiv ${value('arxiv')}`, meta: await metadataFromArxiv(value('arxiv')) }
-  if (source === 'doi') return { source: `DOI ${value('doi')}`, meta: await metadataFromCrossref(value('doi')) }
+  if (source === 'arxiv') {
+    return { source: `arXiv ${value('arxiv')}`, meta: withTypeOverride(await metadataFromArxiv(value('arxiv'))) }
+  }
+  if (source === 'doi') {
+    return { source: `DOI ${value('doi')}`, meta: withTypeOverride(await metadataFromCrossref(value('doi'))) }
+  }
   if (source === 'manual') return { source: `manual ${value('item-type')}`, meta: manualMeta(value('item-type')) }
   if (value('creator') !== null || values('tag').length > 0) {
     throw new UsageError('--creator and --tag apply to --item-type, not --note')
@@ -523,8 +610,9 @@ async function buildPayload(meta) {
   const template = await emptyItem(meta.itemType)
   const creatorType = await creatorTypeFor(meta.itemType)
   // `tags` and the bookkeeping flags are not schema fields: tags are attached after the template is
-  // filled, and the flags would otherwise be reported as fields the type dropped.
-  const { tags, manual, noteItem, note, parentItem, ...fields } = meta
+  // filled, and the flags would otherwise be reported as fields the type dropped. `warnings` is what
+  // the plan says, not what the library stores.
+  const { tags, manual, noteItem, note, parentItem, warnings, ...fields } = meta
   const withCreators = { ...fields, creators: meta.creators.map((c) => ({ ...c, creatorType })) }
   return fillTemplate(template, withCreators)
 }
@@ -592,6 +680,9 @@ async function run() {
     if (meta.manual) throw new UsageError(`--field names fields this type does not have: ${dropped.join(', ')}`)
     log(`    dropped (not valid for this type): ${dropped.join(', ')}`)
   }
+  for (const warning of meta.warnings ?? []) log(`    ${warning}`)
+  const emptyNames = meta.noteItem ? [] : emptyFieldNames(item)
+  if (emptyNames.length) log(`    empty     : ${emptyNames.join(', ')}`)
 
   log('[4] payload:')
   log(JSON.stringify([item], null, 2).split('\n').map((l) => `    ${l}`).join('\n'))
@@ -619,14 +710,12 @@ async function run() {
       ? '\n[5] writing under the authorization already on file — no dialog this time'
       : '\n[5] asking the reference manager for authorization — its dialog will appear',
   )
-  if (!kept) log('    (this request waits for you; it has no timeout)')
+  if (!kept) log(`    (the dialog waits up to ${Math.round(AUTHORIZE_TIMEOUT_MS / 1000)} s for you to answer it)`)
 
   writeAttempted = true
   const created = await createItem(item, gate)
   const body = created.status === 200 ? JSON.parse(created.text) : null
-  // An array POST answers with the saved object; a single-object POST answers with the key.
-  const saved = body?.successful?.['0'] ?? body?.success?.['0']
-  const itemKey = typeof saved === 'string' ? saved : saved?.key
+  const itemKey = createdItemKey(body)
   if (!itemKey) {
     if (!mayHaveLanded(created.status) && created.status !== 200) {
       console.error(`\nThe library refused the create (HTTP ${created.status}): ${created.text.slice(0, 300)}`)
