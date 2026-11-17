@@ -28,6 +28,11 @@
 // over `node:zlib`, so that reading a page as an image costs this package no native module and no
 // Python environment.
 //
+// They are ordinary npm dependencies, not binaries on PATH, and they load only when a rung needs them:
+// `--help`, the library-index rungs and every other program work on a machine where an install went
+// wrong. When one is missing the rung refuses with the one command that installs it, instead of
+// starting with `ERR_MODULE_NOT_FOUND` and a stack that names a `.wasm` file.
+//
 // Usage:
 //   node tools/zotero-pdf.mjs --item <recordKey> --outline
 //   node tools/zotero-pdf.mjs --item <recordKey> --extract [--offset N] [--limit N] [--grep TERM]
@@ -37,7 +42,6 @@ import { readFileSync, mkdirSync, writeFileSync } from 'node:fs'
 import { deflateSync } from 'node:zlib'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { PDFiumLibrary } from '@hyzyla/pdfium'
 import { childrenOf, filePathFrom, localRequest } from './zotero-local-api.mjs'
 import { findPassages, readItemOrRefuse, sliceText } from './zotero-read.mjs'
 import { romanToNumber } from './zotero-section-note.mjs'
@@ -47,6 +51,48 @@ export { filePathFrom }
 
 const READABLE = ['application/pdf', 'application/epub+zip', 'text/html']
 const DEFAULT_LIMIT = 12000
+
+/** Where this package is installed, for the one command that repairs a missing engine. */
+const PACKAGE_ROOT = fileURLToPath(new URL('..', import.meta.url)).replace(/[\\/]+$/, '')
+
+/**
+ * The refusal for a rung whose engine package is missing.
+ *
+ * The two engines are npm packages, not binaries on PATH, and only two of the four rungs need them.
+ * A missing package arrives as `ERR_MODULE_NOT_FOUND` naming a `.wasm` file - correct, and useless to
+ * the reader, who can fix it with one command if anyone says which. This says which.
+ *
+ * @param {string} specifier The package the rung needs.
+ * @returns {Refusal} The refusal to throw.
+ */
+export function missingEngine(specifier) {
+  return new Refusal(`${specifier} is not installed, so this rung cannot run`, {
+    fix: 'both PDF engines are declared by this package and only the reading rungs need them; the library-index rungs work without them',
+    command: `npm install --prefix "${PACKAGE_ROOT}"`,
+    checked: [specifier],
+  })
+}
+
+/**
+ * Import one of the PDF engines, lazily.
+ *
+ * "Not installed" is the only failure this converts: a package that loads and then throws is a real
+ * fault and keeps its own stack, because relabelling it as an install problem would send the reader to
+ * reinstall something that is already there.
+ *
+ * @param {string} specifier The package name, as it appears in package.json.
+ * @param {string} [request] What to import, when it is a path inside that package.
+ * @returns {Promise<any>} The module.
+ */
+export async function importPdfEngine(specifier, request = specifier) {
+  try {
+    return await import(request)
+  } catch (error) {
+    const missing = error?.code === 'ERR_MODULE_NOT_FOUND' || /cannot find (module|package)/i.test(String(error?.message ?? ''))
+    if (missing) throw missingEngine(specifier)
+    throw error
+  }
+}
 
 /** The attachment a reading should use, in the order the disciplines state: PDF, then EPUB, then HTML. */
 export function attachmentOf(children) {
@@ -196,6 +242,26 @@ const RUNG = {
   ],
 }
 
+/**
+ * The file behind one attachment, and where it lives.
+ *
+ * Exported because the coverage plan in `zotero-section-note.mjs` needs the same redirect: two
+ * programs each resolving `file://` their own way is how one of them ends up mishandling a Windows
+ * path (`file:///C:/...` carries the drive in the path segment, not in the host).
+ *
+ * @param {string} attachmentKey The attachment item key.
+ * @returns {Promise<{path: string, bytes: Buffer}>} The file on disk.
+ */
+export async function attachmentFile(attachmentKey) {
+  const redirect = await localRequest('GET', `/api/users/0/items/${attachmentKey}/file`)
+  if (redirect.status !== 302) {
+    throw new Error(`the library did not hand over a path for ${attachmentKey} (HTTP ${redirect.status})`)
+  }
+  const path = filePathFrom(redirect.headers.location)
+  if (!path) throw new Error(`${attachmentKey} answered a location that is not a file: ${redirect.headers.location}`)
+  return { path, bytes: readFileSync(path) }
+}
+
 async function openFile(itemKey) {
   const record = await readItemOrRefuse(itemKey)
   if (record.itemType === 'note') throw new UsageError(`${itemKey} is a note; pass the record the attachment belongs to`)
@@ -208,13 +274,8 @@ async function openFile(itemKey) {
       fix: 'attach the file to the record in the library; a record without one has no text for any rung',
     })
   }
-  const redirect = await localRequest('GET', `/api/users/0/items/${attachment.key}/file`)
-  if (redirect.status !== 302) {
-    throw new Error(`the library did not hand over a path for ${attachment.key} (HTTP ${redirect.status})`)
-  }
-  const path = filePathFrom(redirect.headers.location)
-  if (!path) throw new Error(`${attachment.key} answered a location that is not a file: ${redirect.headers.location}`)
-  return { record, attachment, path, bytes: readFileSync(path) }
+  const { path, bytes } = await attachmentFile(attachment.key)
+  return { record, attachment, path, bytes }
 }
 
 /**
@@ -274,6 +335,28 @@ async function openSource(options) {
 }
 
 /**
+ * Start PDFium, naming an engine whose WebAssembly payload did not load.
+ *
+ * `init()` reads `pdfium.wasm` from beside the package: a truncated or partly copied install imports
+ * cleanly and fails here, which is exactly the case a reinstall repairs. Saying "not installed" for
+ * this would send the reader looking for a package that is already on disk.
+ *
+ * @param {Function} engine The `PDFiumLibrary` export.
+ * @returns {Promise<object>} The initialised library.
+ */
+async function initPdfium(engine) {
+  try {
+    return await engine.init()
+  } catch {
+    throw new Refusal('the PDF engine is installed but did not start', {
+      fix: 'its WebAssembly payload is missing or truncated; reinstalling repairs that and leaves the library untouched',
+      command: `npm install --prefix "${PACKAGE_ROOT}"`,
+      checked: ['@hyzyla/pdfium'],
+    })
+  }
+}
+
+/**
  * The text layer of one PDF, page by page.
  *
  * Shared with the scholarly reader, which fetches an open-access PDF and needs the same extraction
@@ -283,7 +366,8 @@ async function openSource(options) {
  * @returns {Promise<{text: string, pageCount: number}>} The text and the page count.
  */
 export async function extractPdfText(bytes) {
-  const library = await PDFiumLibrary.init()
+  const { PDFiumLibrary } = await importPdfEngine('@hyzyla/pdfium')
+  const library = await initPdfium(PDFiumLibrary)
   const document = await library.loadDocument(new Uint8Array(bytes))
   const pages = []
   for (const page of document.pages()) {
@@ -304,7 +388,7 @@ export async function extractPdfText(bytes) {
  * @returns {Promise<{rows: object[], pageCount: number}>} The outline rows and the page count.
  */
 export async function pdfOutline(bytes) {
-  const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs')
+  const pdfjs = await importPdfEngine('pdfjs-dist', 'pdfjs-dist/legacy/build/pdf.mjs')
   const task = pdfjs.getDocument({ data: new Uint8Array(bytes), useSystemFonts: false, isEvalSupported: false, disableFontFace: true })
   const document = await task.promise
   const rows = outlineRows(await document.getOutline())
@@ -355,7 +439,8 @@ async function runOutline(input) {
 
 async function runRender(input, options) {
   const { attachment, path, bytes } = input
-  const library = await PDFiumLibrary.init()
+  const { PDFiumLibrary } = await importPdfEngine('@hyzyla/pdfium')
+  const library = await initPdfium(PDFiumLibrary)
   const document = await library.loadDocument(new Uint8Array(bytes))
   const indices = parsePages(options.pages, document.getPageCount())
   const base = options.item || urlSlug(options.url)

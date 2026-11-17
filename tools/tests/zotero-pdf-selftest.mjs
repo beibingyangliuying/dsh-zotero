@@ -14,6 +14,8 @@ import {
   encodePng,
   filePathFrom,
   headingOrdinal,
+  importPdfEngine,
+  missingEngine,
   outlineRows,
   parseArgs,
   parsePages,
@@ -135,6 +137,34 @@ refused(() => parseArgs(['--url', 'https://example.org/abc.pdf', '--item', 'ABCD
 refused(() => parseArgs(['--extract']), 'no source is refused')
 refused(() => parseArgs(['--url', 'file:///C:/x.pdf', '--extract']), 'a non-http source is refused')
 refused(() => parseArgs(['--url', 'https://example.org/abc.pdf', '--render']), 'a URL render still names its pages')
+
+console.log('\n[9] the engines load only for the rung that needs them')
+
+const toolSource = readFileSync(new URL('../zotero-pdf.mjs', import.meta.url), 'utf8')
+check(
+  !/^import\s+[^;]*@hyzyla\/pdfium/m.test(toolSource),
+  'no static engine import, so --help and the index rungs survive a broken install',
+)
+check(/importPdfEngine\('@hyzyla\/pdfium'\)/.test(toolSource), 'the extract rung imports it where it is used')
+check(
+  /importPdfEngine\('pdfjs-dist', 'pdfjs-dist\/legacy\/build\/pdf\.mjs'\)/.test(toolSource),
+  'and the outline rung imports its own engine the same way',
+)
+
+const absent = missingEngine('@hyzyla/pdfium')
+check(absent instanceof Error && /not installed/.test(absent.message), 'a missing engine is a refusal, not a module error', absent.message)
+check(/npm install --prefix/.test(absent.command), 'and the refused command is the install itself', absent.command)
+check(absent.command.includes('dsh-zotero'), 'pointed at this package, not at a directory the reader has to guess')
+
+let moduleError = null
+try {
+  await importPdfEngine('@no-such-package/dsh-zotero-probe')
+} catch (error) {
+  moduleError = error
+}
+check(moduleError?.message?.includes('is not installed'), 'a package that is really absent is refused in the same words')
+check(moduleError?.code !== 'ERR_MODULE_NOT_FOUND', 'and the raw module error does not escape to the caller')
+check(String(moduleError?.command ?? '').startsWith('npm install'), 'with the command that repairs it')
 
 console.log(`\n${failures === 0 ? 'PASS' : `FAIL (${failures})`}`)
 process.exit(failures === 0 ? 0 : 1)
