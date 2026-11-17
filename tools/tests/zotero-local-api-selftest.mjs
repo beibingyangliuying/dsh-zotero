@@ -387,7 +387,7 @@ check(createdItemKey({ successful: { 0: { key: 'OBJ1' } } }) === 'OBJ1', 'either
 check(createdItemKey({}) === '', 'an answer that names no key is empty, not undefined')
 check(createdItemKey(null) === '', 'and a body that never parsed does not throw')
 
-console.log('\n[14] a dialog nobody answered is a sentence, not a hang')
+console.log('\n[14] a dialog nobody answered is a sentence about the KEY, not a hang')
 
 const waited = []
 const silentTransport = {
@@ -408,10 +408,63 @@ try {
 } catch (error) {
   silentError = error
 }
+const silentMessage = silentError?.message ?? ''
 check(waited.length === 1 && waited[0] === AUTHORIZE_TIMEOUT_MS, 'the dialog is waited for with a finite ceiling', String(waited[0]))
 check(silentError?.refused === true, 'an unanswered dialog is a refusal, not an unknown outcome')
-check(/not answered within 120 s/.test(silentError?.message ?? ''), 'and the sentence says nobody answered it', firstLine(silentError?.message ?? ''))
-check(/answer the "Allow" dialog/.test(silentError?.message ?? ''), 'and what to do about it')
+check(/not answered within 30 s/.test(silentMessage), 'and the sentence says nobody answered it', firstLine(silentMessage))
+// The half of the message that matters: whether this prompt comes back on every run, and what makes
+// it stop. "Click the dialog" is only the immediate step.
+check(/no key is kept for this library yet/.test(silentMessage), 'and says no key is kept, which is why it asks')
+check(/lasting option/.test(silentMessage), 'and names the choice that stops the asking')
+check(/nothing has been written/.test(silentMessage), 'and says nothing was written, so the command can be repeated')
+
+// The case that asks twice: a kept key the library rejects, then a dialog nobody answers. Saying "no
+// key is kept" here would be false, and would hide the stale key as the cause.
+const replayCalls = { count: 0 }
+const replayTransport = {
+  serverInfo: async () => ({ id: 'srv1', version: 'test' }),
+  // The kept key is rejected by the write, and the dialog that replaces it is never answered: the
+  // sentence has to name the rejected key, or the stale entry stays invisible and the run looks like a
+  // first-time visit.
+  localRequest: async (method, path) => {
+    if (path === '/api/local/authorize') {
+      const error = new Error('nothing answered')
+      error.code = 'ETIMEDOUT'
+      throw error
+    }
+    return { status: 401, headers: {}, text: 'unauthorized' }
+  },
+}
+const replayStore = memoryStore(withGrant(emptyGrantStore(), 'srv1', { key: 'stale', appName: 'x', createdAt: 't' }))
+const replayGate = createWriteGate({ appName: APP_NAME, store: replayStore, transport: replayTransport })
+await replayGate.open()
+let replayMessage = ''
+try {
+  await replayGate.write('PATCH', '/api/users/0/items/AAAAAAAA', { title: 'x' })
+} catch (error) {
+  replayMessage = error.message
+}
+check(/was rejected/.test(replayMessage), 'a rejected key is named as the reason the dialog came back', firstLine(replayMessage))
+check(/replace it/.test(replayMessage), 'and answering is how the stale key goes away')
+
+// A store that knows where it keeps keys says so, and says when the key on file belongs elsewhere: a
+// key is never reused across libraries, which is exactly what a "kept key but still asked" run needs
+// to know.
+const pointedStore = {
+  path: 'C:/keys/zotero-local-api-key.json',
+  load: () => withGrant(emptyGrantStore(), 'srv2', { key: 'other', appName: 'x', createdAt: 't' }),
+  save: () => {},
+}
+const pointedGate = createWriteGate({ appName: APP_NAME, store: pointedStore, transport: silentTransport })
+await pointedGate.open()
+let pointedMessage = ''
+try {
+  await pointedGate.write('PATCH', '/api/users/0/items/AAAAAAAA', { title: 'x' })
+} catch (error) {
+  pointedMessage = error.message
+}
+check(pointedMessage.includes('C:/keys/zotero-local-api-key.json'), 'the grant file is named when the store has one')
+check(/other library id/.test(pointedMessage), 'and a key kept for another library is not mistaken for this one')
 
 console.log(`\n${failures === 0 ? 'PASS' : `FAIL (${failures})`}`)
 process.exit(failures === 0 ? 0 : 1)

@@ -346,10 +346,11 @@ const RETRYABLE_CODES = new Set(['ECONNRESET', 'ECONNABORTED', 'EPIPE'])
  * How long an authorization request waits for the owner to answer the dialog.
  *
  * The request blocks until the dialog is answered, and the owner may have walked away: an unanswered
- * dialog used to mean a caller that never returned and printed nothing. Two minutes is long enough to
- * switch windows and click, and short enough that a session notices it was waiting for a person.
+ * dialog used to mean a caller that never returned and printed nothing. Thirty seconds is long enough
+ * to switch windows and click, and short enough that a run which cannot be answered says so and ends,
+ * instead of holding a session that could have been doing something else.
  */
-export const AUTHORIZE_TIMEOUT_MS = 120_000
+export const AUTHORIZE_TIMEOUT_MS = 30_000
 
 const noop = () => {}
 
@@ -874,6 +875,7 @@ export function withoutGrant(store, serverId) {
  */
 export function fileGrantStore(path = grantFilePath()) {
   return {
+    path,
     load() {
       try {
         return parseGrantStore(readFileSync(path, 'utf8'))
@@ -918,6 +920,34 @@ export function createWriteGate({
   let grants = emptyGrantStore()
   let key = null
   let lasting = false
+  let keptAtOpen = false
+  let droppedKept = false
+
+  /**
+   * What to tell the person when the dialog went unanswered.
+   *
+   * "Click the dialog" is not the useful half: what decides whether the prompt comes back on every run
+   * is whether a key is kept and whether it is still good. So the sentence says which of those is true,
+   * and names the lasting option, which only the person at the screen can choose.
+   *
+   * @returns {string} The refusal message.
+   */
+  function unansweredDialog() {
+    const seconds = Math.round(AUTHORIZE_TIMEOUT_MS / 1000)
+    const kept = droppedKept
+      ? 'the key this library kept was rejected, so it asked again - answer the dialog to replace it'
+      : keptAtOpen
+        ? 'a key was kept for this library and the library still asked, so answer the dialog'
+        : 'no key is kept for this library yet - answer the dialog and choose the lasting option ("Always Allow"), so later runs reuse that key instead of asking again'
+    const where = typeof store.path === 'string' ? ` (kept per library in ${store.path})` : ''
+    const others = Object.keys(grants.grants ?? {}).filter((id) => id !== serverId)
+    const elsewhere =
+      others.length > 0 ? `; a key is kept for ${others.length} other library id(s) and is not reused across libraries` : ''
+    return (
+      `the authorization dialog was not answered within ${seconds} s - ${kept}${where}${elsewhere}. ` +
+      'Then run the same command again: nothing has been written.'
+    )
+  }
 
   async function authorize() {
     // Every answer here arrives BEFORE the write is sent, so each one is a refusal in the sense the
@@ -938,10 +968,7 @@ export function createWriteGate({
       })
     } catch (error) {
       if (error?.code !== 'ETIMEDOUT') throw error
-      throw refusedError(
-        `the authorization dialog was not answered within ${Math.round(AUTHORIZE_TIMEOUT_MS / 1000)} s - ` +
-          'answer the "Allow" dialog in the reference manager, or run the command again when you are at the screen',
-      )
+      throw refusedError(unansweredDialog())
     }
     if (res.status === 403) throw refusedError('the authorization dialog was declined in the reference manager')
     if (res.status === 429) throw refusedError('too many authorization dialogs (limit 5/min) - wait a minute')
@@ -964,6 +991,7 @@ export function createWriteGate({
     if (lasting) {
       grants = withoutGrant(grants, serverId)
       store.save(grants)
+      droppedKept = true
       onGrantDropped?.({ serverId })
     }
     key = null
@@ -977,6 +1005,7 @@ export function createWriteGate({
       grants = store.load()
       key = keptGrant(grants, serverId)
       lasting = key !== null
+      keptAtOpen = lasting
       return { ...info, kept: lasting }
     },
 
