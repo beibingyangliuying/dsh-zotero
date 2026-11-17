@@ -13,6 +13,7 @@ import {
   crc32,
   encodePng,
   filePathFrom,
+  headingCandidates,
   headingOrdinal,
   importPdfEngine,
   missingEngine,
@@ -165,6 +166,41 @@ try {
 check(moduleError?.message?.includes('is not installed'), 'a package that is really absent is refused in the same words')
 check(moduleError?.code !== 'ERR_MODULE_NOT_FOUND', 'and the raw module error does not escape to the caller')
 check(String(moduleError?.command ?? '').startsWith('npm install'), 'with the command that repairs it')
+
+// A file with no bookmarks still shows its headings, but only the shapes a publisher uses: a body
+// sentence, a unit beside a number, and a repeated number must not become candidates.
+const candidates = headingCandidates(
+  [
+    '1 Introduction',
+    '2.1 The grid model',
+    'III. METHOD',
+    'Appendix A Instrumentation',
+    '第2章 系统模型',
+    '1 Introduction',
+    '1 Something else',
+    '3 This sentence ends here.',
+    '7 GHz',
+    'the model is described below',
+  ].join('\n'),
+)
+same(candidates.length, 5, 'a heading-shaped line becomes a candidate, a body line does not')
+same(candidates[0].title, 'Introduction', 'and the numbering is stripped from the title')
+same(candidates[0].depth, 0, 'a top-level number is depth 0')
+same(candidates[1].ordinal, '2.1', 'a subsection keeps its own number')
+same(candidates[1].depth, 1, 'and its depth follows the number')
+same(candidates[2].ordinal, 'III', 'a roman numeral is a candidate')
+same(candidates[3].ordinal, 'A', 'so is an appendix letter')
+same(candidates[4].ordinal, '2', 'and a Chinese chapter')
+same(candidates[4].title, '系统模型', 'named as the text writes it')
+check(
+  !candidates.some((row) => row.title === 'Something else'),
+  'the same number twice keeps the first title, because a repeated heading is a page header',
+)
+same(headingCandidates('').length, 0, 'no text means no candidates rather than a guess')
+check(
+  /headingCandidates\(\(await extractPdfText\(bytes\)\)\.text\)/.test(toolSource),
+  'the outline rung falls back to the text it can read, not to a pattern over the PDF bytes',
+)
 
 console.log(`\n${failures === 0 ? 'PASS' : `FAIL (${failures})`}`)
 process.exit(failures === 0 ? 0 : 1)

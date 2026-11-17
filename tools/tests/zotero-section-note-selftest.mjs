@@ -357,12 +357,18 @@ const scratch = mkdtempSync(join(tmpdir(), 'section-note-'))
 const grantPath = join(scratch, 'grant.json')
 // A one-page PDF written by hand, with or without one bookmark: the plan is only checkable if it can
 // show the title behind a section number, and the outline reader must not need a fixture binary.
-const buildPdf = (bookmark) => {
+const buildPdf = (bookmark, lines = []) => {
+  const text = lines
+    .map((line) => `(${String(line).replace(/[\\()]/g, (char) => `\\${char}`)}) Tj T*`)
+    .join('\n')
+  const content = text ? `BT /F1 12 Tf 20 150 Td 14 TL\n${text}\nET` : ''
   const objects = [
     `<< /Type /Catalog /Pages 2 0 R${bookmark ? ' /Outlines 4 0 R' : ''} >>`,
     '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
-    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>',
-    bookmark ? '<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>' : '<< /Type /Outlines /Count 0 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 6 0 R >> >> /Contents 5 0 R >>',
+    bookmark ? '<< /Type /Outlines /First 7 0 R /Last 7 0 R /Count 1 >>' : '<< /Type /Outlines /Count 0 >>',
+    `<< /Length ${Buffer.byteLength(content, 'latin1')} >>\nstream\n${content}\nendstream`,
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
     bookmark ? `<< /Title (${bookmark}) /Parent 4 0 R /Dest [3 0 R /Fit] >>` : '<< >>',
   ]
   let pdf = '%PDF-1.4\n'
@@ -382,7 +388,7 @@ const fileFor = {
   PDF2: join(scratch, 'plain.pdf'),
 }
 writeFileSync(fileFor.PDF1, buildPdf('1 Introduction'))
-writeFileSync(fileFor.PDF2, buildPdf(''))
+writeFileSync(fileFor.PDF2, buildPdf('', ['1 Introduction', '2 Model', 'The grid model is described below.']))
 let created = 0
 const server = createServer((req, res) => {
   const url = new URL(req.url ?? '/', 'http://127.0.0.1')
@@ -533,6 +539,21 @@ check(
 const plainPlan = await runAsync(['--item', 'REC6'])
 same(plainPlan.status, 0, 'a file without bookmarks is still a plan')
 check(plainPlan.stdout.includes('outline : none'), 'and it says none rather than printing nothing', plainPlan.stdout)
+// A file with no bookmarks still shows its headings, but as candidates: the rows come from the text,
+// so the plan must say what they are and must not mark any of them covered.
+check(plainPlan.stdout.includes('candidates : 2 heading-shaped lines'), 'and shows the headings its text carries, named as candidates', plainPlan.stdout)
+check(/§1\s+Introduction/.test(plainPlan.stdout) && /§2\s+Model/.test(plainPlan.stdout), 'with the titles')
+check(!plainPlan.stdout.includes('<- covered'), 'and marks none of them covered, because the file did not declare them')
+check(
+  plainPlan.stdout.includes('not entries the file declares'),
+  'and says what a candidate is worth before the numbers are cited',
+  plainPlan.stdout,
+)
+const plainJson = await runAsync(['--item', 'REC6', '--json'])
+const plainPlanJson = JSON.parse(plainJson.stdout)
+same(plainPlanJson.outline.entries.length, 0, 'the JSON plan keeps the file\'s own entries empty when there are none')
+same(plainPlanJson.outline.candidates.length, 2, 'and carries the candidates separately')
+same(plainPlanJson.outline.candidates[0].title, 'Introduction', 'with the numbering stripped from the title')
 
 const bodyFile = join(scratch, 'new.html')
 writeFileSync(bodyFile, '<p>new body</p>', 'utf8')

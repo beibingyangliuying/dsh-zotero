@@ -649,10 +649,17 @@ export function planJson({ record, attachment, notes, outline = null }) {
     // The file's own table of contents, when it was read: the plan's coverage line names sections by
     // number, and a number alone is not checkable without the title it belongs to. A file whose
     // bookmarks could not be read keeps the reason, so a round does not mistake silence for "none".
+    // A file with no bookmarks carries `candidates` instead - heading-shaped lines from its text,
+    // named as candidates so nothing downstream reads them as the file's own structure.
     outline: outline
       ? outline.unavailable
         ? { unavailable: outline.unavailable }
-        : { pageCount: outline.pageCount, entries: outline.entries }
+        : {
+            pageCount: outline.pageCount,
+            entries: outline.entries,
+            ...(outline.candidates ? { candidates: outline.candidates } : {}),
+            ...(outline.candidatesUnavailable ? { candidatesUnavailable: outline.candidatesUnavailable } : {}),
+          }
       : null,
     notes: notes.map((note) => ({
       key: note.key,
@@ -730,13 +737,33 @@ export function markOutlineRows(rows, claimed) {
  */
 async function outlineOf(attachment) {
   try {
-    const { attachmentFile, pdfOutline } = await import('./zotero-pdf.mjs')
+    const { attachmentFile, pdfOutline, extractPdfText, headingCandidates } = await import('./zotero-pdf.mjs')
     const { bytes } = await attachmentFile(attachment.key)
     const { rows, pageCount } = await pdfOutline(bytes)
-    return { pageCount, rows }
+    if (rows.length || (attachment.data?.contentType ?? '') !== 'application/pdf') return { pageCount, rows }
+    try {
+      return { pageCount, rows, candidates: headingCandidates((await extractPdfText(bytes)).text) }
+    } catch (error) {
+      return { pageCount, rows, candidatesUnavailable: String(error?.message ?? error).split('\n')[0] }
+    }
   } catch (error) {
     return { unavailable: String(error?.message ?? error).split('\n')[0] }
   }
+}
+
+/** What the plan says about the file's headings: its own entries, or the candidates its text shows. */
+function planOutline(outline, claimed) {
+  if (!outline) return null
+  if (outline.unavailable) return { unavailable: outline.unavailable }
+  if (outline.rows.length === 0) {
+    return {
+      pageCount: outline.pageCount,
+      entries: [],
+      ...(outline.candidates?.length ? { candidates: outline.candidates } : {}),
+      ...(outline.candidatesUnavailable ? { candidatesUnavailable: outline.candidatesUnavailable } : {}),
+    }
+  }
+  return { pageCount: outline.pageCount, entries: markOutlineRows(outline.rows, claimed) }
 }
 
 /** The plan half of `--item …, no --section`: what this record covers, and what to go read. */
@@ -751,10 +778,9 @@ async function runPlan(itemKey, { json = false } = {}) {
       ['application/pdf', 'application/epub+zip', 'text/html'].includes(child.data?.contentType ?? ''),
   )
   if (json) {
-    const outline = attachment ? await outlineOf(attachment) : null
     const claimed = new Set(notes.filter((note) => note.claim.token && !note.retired && !note.digest).map((note) => note.claim.token))
-    const planInput = outline?.rows ? { pageCount: outline.pageCount, entries: markOutlineRows(outline.rows, claimed) } : outline
-    console.log(JSON.stringify(planJson({ record, attachment, notes, outline: planInput }), null, 2))
+    const outline = attachment ? planOutline(await outlineOf(attachment), claimed) : null
+    console.log(JSON.stringify(planJson({ record, attachment, notes, outline }), null, 2))
     return
   }
   console.log(`record : ${itemKey}  [${record.itemType}]  "${record.title ?? ''}"`)
@@ -769,9 +795,19 @@ async function runPlan(itemKey, { json = false } = {}) {
     if (outline.unavailable) {
       console.log(`outline : unavailable - ${outline.unavailable}`)
     } else if (outline.rows.length === 0) {
-      console.log(
-        "outline : none - this file carries no bookmarks, so the section titles are only in its text (zotero-pdf.mjs --extract)",
-      )
+      console.log('outline : none - this file carries no bookmarks, so the section titles are only in its text')
+      if (outline.candidates?.length) {
+        const count = outline.candidates.length
+        console.log(
+          `candidates : ${count} heading-shaped line${count === 1 ? '' : 's'} from the text, not from the file's table of contents`,
+        )
+        for (const row of outline.candidates) {
+          console.log(`  ${'  '.repeat(row.depth ?? 0)}§${String(row.ordinal).padEnd(3)} ${row.title}`)
+        }
+        console.log('note    : these are shapes the text shows, not entries the file declares, so none is marked covered')
+      } else if (outline.candidatesUnavailable) {
+        console.log(`candidates : unavailable - ${outline.candidatesUnavailable}`)
+      }
     } else {
       const marked = markOutlineRows(outline.rows, claimedTokens)
       console.log(`outline : ${marked.length} entr${marked.length === 1 ? 'y' : 'ies'} in the file's own table of contents`)

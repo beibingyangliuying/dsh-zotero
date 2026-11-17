@@ -137,6 +137,52 @@ export function outlineRows(items, depth = 0) {
   return rows
 }
 
+/**
+ * Heading-shaped lines in the text, for a file that carries no bookmarks.
+ *
+ * These rows are candidates, not structure: they are what the text looks like when read as lines,
+ * and they exist so that a person can see the numbering before writing a section note. Only the
+ * shapes publishers use for headings are accepted - a number, a roman numeral, `Appendix A`, or a
+ * Chinese 第…章/节 - and anything that reads as a sentence, a unit, or a lowercase fragment is
+ * dropped, because a body line is not a heading and a guess is worse than silence.
+ *
+ * @param {string} text The text layer.
+ * @returns {object[]} Rows shaped `{ordinal, title, depth}`, in the order they appear.
+ */
+export function headingCandidates(text) {
+  const shapes = [
+    { pattern: /^(\d{1,2}(?:\.\d{1,2}){0,2})\.?\s+(\S.*)$/, depth: (ordinal) => ordinal.split('.').length - 1 },
+    { pattern: /^([IVX]{1,6})\.\s+(\S.*)$/, depth: () => 0 },
+    { pattern: /^Appendix\s+([A-Z][0-9]?)\b\.?\s+(\S.*)$/, depth: () => 0 },
+    { pattern: /^第\s*([0-9一二三四五六七八九十百零〇]{1,6})\s*[章節节]\s*(\S.*)$/, depth: () => 0 },
+  ]
+  const titleShaped = (title) => {
+    if (title.split(' ').length > 16) return false
+    if (/^[a-z]/.test(title)) return false
+    if (/[.,;:!?、，；：！？]$/.test(title)) return false
+    if (/\.\s/.test(title)) return false
+    return !/^[A-Za-z]{1,4}$/.test(title)
+  }
+  const rows = []
+  const seen = new Set()
+  for (const raw of String(text ?? '').split(/\r?\n/)) {
+    const line = raw.replace(/\s+/g, ' ').trim()
+    if (line.length < 4 || line.length > 100) continue
+    for (const shape of shapes) {
+      const match = shape.pattern.exec(line)
+      if (!match) continue
+      const title = match[2].trim()
+      if (!titleShaped(title)) break
+      if (seen.has(match[1])) break
+      seen.add(match[1])
+      rows.push({ ordinal: match[1], title, depth: shape.depth(match[1]) })
+      break
+    }
+    if (rows.length >= 80) break
+  }
+  return rows
+}
+
 // --- PNG, encoded here so that nothing native has to ship -----------------------------------------
 
 const CRC_TABLE = (() => {
@@ -425,9 +471,30 @@ async function runOutline(input) {
   console.log(`file    : ${path}  ${pageCount} pages  ${rows.length} entries`)
   console.log(RUNG.outline.join('\n'))
   if (rows.length === 0) {
-    console.error('\nThis file carries no table of contents, so rung (3) has nothing to give: read the')
-    console.error('boundaries from the text (rung (1) or (2)) and write down the headings you find.')
-    return 1
+    let candidates = []
+    let reason = ''
+    try {
+      candidates = headingCandidates((await extractPdfText(bytes)).text)
+    } catch (error) {
+      reason = String(error?.message ?? error).split('\n')[0]
+    }
+    if (candidates.length === 0) {
+      console.error('\nThis file carries no table of contents, so rung (3) has nothing to give: read the')
+      console.error('boundaries from the text (rung (1) or (2)) and write down the headings you find.')
+      if (reason) console.error(`\nIts text could not be read either: ${reason}`)
+      return 1
+    }
+    console.log('')
+    console.log(
+      `candidates : ${candidates.length} heading-shaped line${candidates.length === 1 ? '' : 's'} read from the text, not from the file's table of contents`,
+    )
+    for (const row of candidates) {
+      console.log(`  ${'  '.repeat(row.depth ?? 0)}§${String(row.ordinal).padEnd(3)} ${row.title}`)
+    }
+    console.log('')
+    console.log('  These are shapes the text shows, not entries the file declares: a preprint and its issue')
+    console.log('  can number the same section differently, so read the title before citing the number.')
+    return 0
   }
   console.log('')
   for (const row of rows) {

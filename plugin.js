@@ -66,7 +66,8 @@ const CATALOG = [
   },
   {
     program: 'zotero-pdf',
-    purpose: 'the attachment side: its outline, its text layer, or a page rendered to an image; rungs are chosen one per call',
+    purpose:
+      'the attachment side: its outline, its text layer, or a page rendered to an image; a file without bookmarks answers with heading-shaped lines from its text, named as candidates; rungs are chosen one per call',
     example: ['--item', 'ABCD1234', '--extract'],
   },
   {
