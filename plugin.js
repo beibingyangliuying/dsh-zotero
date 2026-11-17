@@ -81,7 +81,8 @@ const CATALOG = [
   },
   {
     program: 'zotero-section-note',
-    purpose: 'one explanation note per top-level section: coverage plan, claim, rewrite, retire; writes need --write',
+    purpose:
+      'one explanation note per top-level section: a coverage plan that names each section by the title the file itself carries, claim, rewrite, retire; writes need --write',
     example: ['--item', 'ABCD1234'],
   },
   {

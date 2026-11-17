@@ -5,7 +5,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
   AGENT_TAG,
   REPAIRED_TAG,
@@ -25,6 +25,7 @@ import {
   isRetired,
   isReviewed,
   looksLikeHtml,
+  markOutlineRows,
   normalizeSectionToken,
   planJson,
   provenanceOf,
@@ -234,6 +235,35 @@ same(allowedMoves({ tags: ['/section-2', '/retired'], token: '2', retired: true 
 same(allowedMoves({ tags: ['/digest'], digest: true }).join(' '), 'leave', 'a legacy whole-paper summary is left alone')
 same(allowedMoves({ tags: ['/section-2', '/section-3'], ambiguous: true }).join(' '), 'unclaim', 'an ambiguous note may only lose one tag')
 
+console.log('\n[6c] the file\'s own table of contents, marked against the record')
+const outlineRows = [
+  { ordinal: '1', title: 'Introduction', depth: 0 },
+  { ordinal: '2', title: 'Method', depth: 0 },
+  { ordinal: '', title: 'Preface', depth: 0 },
+  { ordinal: '2.1', title: 'Data', depth: 1 },
+]
+const markedRows = markOutlineRows(outlineRows, new Set(['2']))
+same(markedRows.map((row) => row.covered).join(' '), 'false true false false', 'only the row whose number a record explains is marked')
+same(markedRows.find((row) => row.ordinal === '2.1').covered, false, 'a subsection is not covered because its parent is')
+same(outlineRows.some((row) => 'covered' in row), false, 'the rows handed in are not modified')
+same(markOutlineRows([{ ordinal: '', title: 'No number' }], new Set(['']))[0].covered, false, 'a row with no number is never covered')
+const planWithOutline = planJson({
+  record: { key: 'REC1', itemType: 'journalArticle', title: 'A paper' },
+  attachment: { key: 'PDF1', data: { contentType: 'application/pdf' } },
+  notes: [planNote('LIVE2', { section: '2' })],
+  outline: { pageCount: 4, entries: markedRows },
+})
+same(planWithOutline.outline.pageCount, 4, 'the plan carries the page count the outline was read from')
+same(planWithOutline.outline.entries.filter((row) => row.covered).length, 1, 'and the covered rows, with their titles')
+const planUnread = planJson({
+  record: { key: 'REC1', itemType: 'journalArticle', title: 'A paper' },
+  attachment: { key: 'PDF1', data: { contentType: 'application/pdf' } },
+  notes: [],
+  outline: { unavailable: 'the PDF engine is not installed' },
+})
+same(planUnread.outline.unavailable, 'the PDF engine is not installed', 'an outline that could not be read keeps its reason')
+same(planJson({ record: { key: 'REC1', itemType: 'journalArticle' }, attachment: null, notes: [] }).outline, null, 'a record with no file carries no outline')
+
 console.log('\n[7] the tool still says what it is doing')
 const source = readFileSync(fileURLToPath(new URL('../zotero-section-note.mjs', import.meta.url)), 'utf8')
 check(source.includes('REFUSED: §'), 'the refusal names the section it refuses')
@@ -267,6 +297,13 @@ const stubItems = {
   REC2: { key: 'REC2', itemType: 'journalArticle', title: 'An empty record', version: 1 },
   REC3: { key: 'REC3', itemType: 'journalArticle', title: 'A record whose note is ambiguous', version: 1 },
   REC4: { key: 'REC4', itemType: 'journalArticle', title: 'A record whose tag removal never reads back', version: 1 },
+  REC5: { key: 'REC5', itemType: 'journalArticle', title: 'A record whose file carries bookmarks', version: 1 },
+  REC6: { key: 'REC6', itemType: 'journalArticle', title: 'A record whose file carries none', version: 1 },
+  PDF1: { key: 'PDF1', itemType: 'attachment', contentType: 'application/pdf', parentItem: 'REC5', version: 20 },
+  PDF2: { key: 'PDF2', itemType: 'attachment', contentType: 'application/pdf', parentItem: 'REC6', version: 21 },
+  S1: { key: 'S1', itemType: 'note', note: '<p>§1</p>', tags: [{ tag: '/section-1' }], version: 30, parentItem: 'REC5' },
+  S2: { key: 'S2', itemType: 'note', note: '<p>§2</p>', tags: [{ tag: '/section-2' }], version: 31, parentItem: 'REC5' },
+  S3: { key: 'S3', itemType: 'note', note: '<p>§3</p>', tags: [{ tag: '/section-3' }], version: 32, parentItem: 'REC6' },
   AMB2: {
     key: 'AMB2',
     itemType: 'note',
@@ -306,11 +343,46 @@ const stubItems = {
     parentItem: 'REC1',
   },
 }
-const childKeys = { REC1: ['LIVE2', 'UNK', 'DIG', 'OLD', 'AGU', 'RV6'], REC2: [], REC3: ['AMB1'], REC4: ['AMB2', 'RET1', 'UNCONF1'] }
+const childKeys = {
+  REC1: ['LIVE2', 'UNK', 'DIG', 'OLD', 'AGU', 'RV6'],
+  REC2: [],
+  REC3: ['AMB1'],
+  REC4: ['AMB2', 'RET1', 'UNCONF1'],
+  REC5: ['PDF1', 'S1', 'S2'],
+  REC6: ['PDF2', 'S3'],
+}
 const requests = []
 const deleted = new Set()
 const scratch = mkdtempSync(join(tmpdir(), 'section-note-'))
 const grantPath = join(scratch, 'grant.json')
+// A one-page PDF written by hand, with or without one bookmark: the plan is only checkable if it can
+// show the title behind a section number, and the outline reader must not need a fixture binary.
+const buildPdf = (bookmark) => {
+  const objects = [
+    `<< /Type /Catalog /Pages 2 0 R${bookmark ? ' /Outlines 4 0 R' : ''} >>`,
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>',
+    bookmark ? '<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>' : '<< /Type /Outlines /Count 0 >>',
+    bookmark ? `<< /Title (${bookmark}) /Parent 4 0 R /Dest [3 0 R /Fit] >>` : '<< >>',
+  ]
+  let pdf = '%PDF-1.4\n'
+  const offsets = []
+  objects.forEach((body, index) => {
+    offsets.push(Buffer.byteLength(pdf, 'latin1'))
+    pdf += `${index + 1} 0 obj\n${body}\nendobj\n`
+  })
+  const xref = Buffer.byteLength(pdf, 'latin1')
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`
+  pdf += offsets.map((offset) => `${String(offset).padStart(10, '0')} 00000 n \n`).join('')
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`
+  return Buffer.from(pdf, 'latin1')
+}
+const fileFor = {
+  PDF1: join(scratch, 'bookmarked.pdf'),
+  PDF2: join(scratch, 'plain.pdf'),
+}
+writeFileSync(fileFor.PDF1, buildPdf('1 Introduction'))
+writeFileSync(fileFor.PDF2, buildPdf(''))
 let created = 0
 const server = createServer((req, res) => {
   const url = new URL(req.url ?? '/', 'http://127.0.0.1')
@@ -357,6 +429,14 @@ const server = createServer((req, res) => {
   const children = /^\/api\/users\/0\/items\/([A-Z0-9]+)\/children$/.exec(url.pathname)
   if (children && childKeys[children[1]]) {
     send(200, childKeys[children[1]].map((key) => ({ key, data: stubItems[key] })))
+    return
+  }
+  const fileRoute = /^\/api\/users\/0\/items\/([A-Z0-9]+)\/file$/.exec(url.pathname)
+  if (fileRoute && fileFor[fileRoute[1]]) {
+    // The local API answers the file rung with a redirect to a path on this machine; the plan resolves
+    // it through the same helper the PDF program uses, so a Windows path cannot be read as a URL here.
+    res.writeHead(302, { location: pathToFileURL(fileFor[fileRoute[1]]).href })
+    res.end()
     return
   }
   const match = /^\/api\/users\/0\/items\/([A-Z0-9]+)$/.exec(url.pathname)
@@ -433,6 +513,26 @@ const prosePlan = await runAsync(['--item', 'REC1'])
 same(prosePlan.status, 0, 'the prose plan exits 0')
 check(prosePlan.stdout.includes('moves:'), 'the prose plan prints the moves beside the class')
 check(prosePlan.stdout.includes('class: agent'), 'and the class word the discipline reads')
+
+const bookmarkedPlan = await runAsync(['--item', 'REC5'])
+same(bookmarkedPlan.status, 0, 'a plan whose file carries bookmarks exits 0')
+check(
+  bookmarkedPlan.stdout.includes("outline : 1 entry in the file's own table of contents"),
+  'the plan prints the file\'s own table of contents',
+  bookmarkedPlan.stdout,
+)
+// The title is printed as the file declares it, numbering included: the ordinal beside it is this
+// tool's reading, and dropping the file's own prefix would make the plan disagree with --outline.
+check(/§1\s+1 Introduction/.test(bookmarkedPlan.stdout), 'with the title the file declares behind the number a note claims')
+check(bookmarkedPlan.stdout.includes('Introduction  <- covered'), 'and marks the section a note already explains')
+check(
+  bookmarkedPlan.stdout.includes('claimed : §2 has no outline entry'),
+  'and says when a claim names a section this file does not carry',
+  bookmarkedPlan.stdout,
+)
+const plainPlan = await runAsync(['--item', 'REC6'])
+same(plainPlan.status, 0, 'a file without bookmarks is still a plan')
+check(plainPlan.stdout.includes('outline : none'), 'and it says none rather than printing nothing', plainPlan.stdout)
 
 const bodyFile = join(scratch, 'new.html')
 writeFileSync(bodyFile, '<p>new body</p>', 'utf8')

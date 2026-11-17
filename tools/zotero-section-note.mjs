@@ -627,10 +627,11 @@ function ambiguousLive(notes) {
  * A round that has to hand the owner one list across several records needs the same facts in a shape
  * it can join on, because prose joined by hand is how each round ends up inventing its own list.
  *
- * @param {{record: object, attachment: object|undefined, notes: Array<object>}} input The record's state.
+ * @param {{record: object, attachment: object|undefined, notes: Array<object>, outline?: object|null}} input
+ *   The record's state, and the file's table of contents when one was read.
  * @returns {object} A JSON-serializable plan.
  */
-export function planJson({ record, attachment, notes }) {
+export function planJson({ record, attachment, notes, outline = null }) {
   const live = notes.filter((note) => note.claim.token && !note.retired && !note.digest)
   const retired = notes.filter((note) => note.retired)
   const legacy = notes.filter((note) => note.digest && !note.retired)
@@ -645,6 +646,14 @@ export function planJson({ record, attachment, notes }) {
   return {
     record: { key: record.key, itemType: record.itemType, title: record.title ?? '' },
     file: attachment ? { key: attachment.key, contentType: attachment.data?.contentType ?? '' } : null,
+    // The file's own table of contents, when it was read: the plan's coverage line names sections by
+    // number, and a number alone is not checkable without the title it belongs to. A file whose
+    // bookmarks could not be read keeps the reason, so a round does not mistake silence for "none".
+    outline: outline
+      ? outline.unavailable
+        ? { unavailable: outline.unavailable }
+        : { pageCount: outline.pageCount, entries: outline.entries }
+      : null,
     notes: notes.map((note) => ({
       key: note.key,
       chars: note.html.length,
@@ -694,6 +703,42 @@ export function planJson({ record, attachment, notes }) {
   }
 }
 
+/**
+ * The file's own table of contents, with the sections this record already explains marked.
+ *
+ * The plan states coverage as section numbers. A number is only checkable next to the title it names,
+ * and asking for a second command to get the title is how a round ends up trusting the number instead.
+ *
+ * @param {Array<{ordinal: string, title: string, depth: number}>} rows The file's bookmarks.
+ * @param {Iterable<string>} claimed Section tokens the live notes claim.
+ * @returns {Array<{ordinal: string, title: string, depth: number, covered: boolean}>} The marked rows.
+ */
+export function markOutlineRows(rows, claimed) {
+  const tokens = new Set([...claimed].map((token) => String(token)))
+  return rows.map((row) => ({ ...row, covered: String(row.ordinal ?? '') !== '' && tokens.has(String(row.ordinal)) }))
+}
+
+/**
+ * Read the file's bookmarks, or the reason there are none to print.
+ *
+ * The PDF rungs live in the other program, which imports `romanToNumber` from this one; a static import
+ * back would make the two programs import each other. Loading it on use keeps the static graph a DAG,
+ * and a plan that cannot read bookmarks is still a plan: the coverage it prints does not depend on them.
+ *
+ * @param {object} attachment The attachment child item.
+ * @returns {Promise<{pageCount: number, entries: object[]}|{unavailable: string}>} What was found.
+ */
+async function outlineOf(attachment) {
+  try {
+    const { attachmentFile, pdfOutline } = await import('./zotero-pdf.mjs')
+    const { bytes } = await attachmentFile(attachment.key)
+    const { rows, pageCount } = await pdfOutline(bytes)
+    return { pageCount, rows }
+  } catch (error) {
+    return { unavailable: String(error?.message ?? error).split('\n')[0] }
+  }
+}
+
 /** The plan half of `--item …, no --section`: what this record covers, and what to go read. */
 async function runPlan(itemKey, { json = false } = {}) {
   const record = await readItem(itemKey)
@@ -706,13 +751,42 @@ async function runPlan(itemKey, { json = false } = {}) {
       ['application/pdf', 'application/epub+zip', 'text/html'].includes(child.data?.contentType ?? ''),
   )
   if (json) {
-    console.log(JSON.stringify(planJson({ record, attachment, notes }), null, 2))
+    const outline = attachment ? await outlineOf(attachment) : null
+    const claimed = new Set(notes.filter((note) => note.claim.token && !note.retired && !note.digest).map((note) => note.claim.token))
+    const planInput = outline?.rows ? { pageCount: outline.pageCount, entries: markOutlineRows(outline.rows, claimed) } : outline
+    console.log(JSON.stringify(planJson({ record, attachment, notes, outline: planInput }), null, 2))
     return
   }
   console.log(`record : ${itemKey}  [${record.itemType}]  "${record.title ?? ''}"`)
   console.log(
     `file   : ${attachment ? `${attachment.key}  ${attachment.data.contentType}` : 'NO PDF/EPUB/HTML ATTACHMENT - nothing here can be read as text'}`,
   )
+  const claimedTokens = new Set(
+    notes.filter((note) => note.claim.token && !note.retired && !note.digest).map((note) => note.claim.token),
+  )
+  if (attachment) {
+    const outline = await outlineOf(attachment)
+    if (outline.unavailable) {
+      console.log(`outline : unavailable - ${outline.unavailable}`)
+    } else if (outline.rows.length === 0) {
+      console.log(
+        "outline : none - this file carries no bookmarks, so the section titles are only in its text (zotero-pdf.mjs --extract)",
+      )
+    } else {
+      const marked = markOutlineRows(outline.rows, claimedTokens)
+      console.log(`outline : ${marked.length} entr${marked.length === 1 ? 'y' : 'ies'} in the file's own table of contents`)
+      for (const row of marked) {
+        const ordinal = row.ordinal ? `§${String(row.ordinal).padEnd(3)}` : '     '
+        console.log(`  ${'  '.repeat(row.depth ?? 0)}${ordinal} ${row.title}${row.covered ? '  <- covered' : ''}`)
+      }
+      const untitled = [...claimedTokens].filter((token) => !marked.some((row) => String(row.ordinal) === String(token)))
+      if (untitled.length) {
+        console.log(
+          `claimed : ${untitled.map((token) => `§${token}`).join(' · ')} ${untitled.length === 1 ? 'has' : 'have'} no outline entry - check that the number is the one this file uses (a preprint and its issue can differ)`,
+        )
+      }
+    }
+  }
   console.log(`notes  : ${notes.length} child note(s)`)
 
   for (const note of notes) {
