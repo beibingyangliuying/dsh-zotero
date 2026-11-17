@@ -20,6 +20,12 @@
 //     rows (whose titles happened to be the paper titles), two `note` rows with EMPTY titles, and one
 //     real record. Printing them as they arrive therefore shows duplicates and blank lines. Every row
 //     is collapsed onto the record it belongs to, and the kind of each hit is stated.
+//   * A HIT IN A FILE IS NOT A HIT IN THE RECORD. `qmode=everything` matches attachment text and note
+//     bodies, so a record can answer a query its title, creators and year never mention - measured: a
+//     search for a topic returned five records that only mention the term inside their PDFs. The tool
+//     therefore prints where each record matched (`matchScope`), marks a record answered by a file row
+//     `only : content`, and adds `also :` when the record's own fields carry the query after all - the
+//     library never says why it matched, so no absence is ever inferred from a row kind.
 //   * THERE IS NO "MATCHED WHERE" FIELD. The library reports the rows, not the reason. So this tool
 //     says which row matched and which mode searched - never a claim the API did not make.
 //   * `itemKey=a,b` IS NOT A PLAIN MULTI-GET. Asked for two keys, the library answered with six rows:
@@ -161,6 +167,52 @@ export function groupHits(rows) {
     groups.set(hit.parentKey, group)
   }
   return [...groups.values()]
+}
+
+/**
+ * Where the rows that named a record matched, in the words a reader can act on.
+ *
+ * The library answers rows and no "matched because" field, so this states WHICH ROW came back, never a
+ * reason the API gave. The distinction matters at the only question this tool is asked with a search: a
+ * record answered by its own row matched somewhere in its metadata, while a record answered by an
+ * attachment or note row matched inside a file. Neither says why, and a file row in particular does not
+ * establish that the title, creators or year lack the query - only `metadataMentions` checks that, and
+ * only to add a positive.
+ *
+ * @param {{sources: Array<{kind: string}>}} group One grouped record.
+ * @returns {string} `'metadata'`, `'text'`, `'notes'`, or a `+`-joined combination of them.
+ */
+export function matchScope(group) {
+  const kinds = new Set((group?.sources ?? []).map((source) => source.kind))
+  const parts = [
+    kinds.has('item') ? 'metadata' : '',
+    kinds.has('note') ? 'notes' : '',
+    kinds.has('attachment') ? 'text' : '',
+  ].filter(Boolean)
+  return parts.join('+') || 'unknown'
+}
+
+/**
+ * Whether a record's own metadata carries the query, compared the way this file compares titles.
+ *
+ * This exists to stop a body hit from being read as a topical one: a record answered by a file or note
+ * row is reported as such, and this says whether the record's own fields carry the same terms, so a
+ * metadata hit that merely arrived as a file row is not mistaken for a hit in the file alone. A
+ * mismatch prints nothing - the library's index can match a phrase this comparison does not, and
+ * claiming "the title lacks it" from a miss would be exactly the over-claim this file avoids.
+ *
+ * @param {object|null} record The record the rows belong to.
+ * @param {string} query What was searched for.
+ * @returns {boolean} True when title, abstract, date or a creator's name carries the query.
+ */
+export function metadataMentions(record, query) {
+  const needle = normalizeTitle(query)
+  if (!needle || !record) return false
+  const name = (creator) => creator?.name || [creator?.firstName, creator?.lastName].filter(Boolean).join(' ')
+  const haystack = normalizeTitle(
+    [record.title, record.abstractNote, record.date, ...(record.creators ?? []).map(name)].filter(Boolean).join(' '),
+  )
+  return haystack.includes(needle)
 }
 
 /**
@@ -414,6 +466,8 @@ export function rankPassages(documents, query, { limit = 4, k1 = 1.5, b = 0.75 }
 const USAGE =
   'usage: node tools/zotero-read.mjs --search "<query>" [--qmode everything|titleCreatorYear] [--limit N] [--tag TAG]\n' +
   '                                  [--sort FIELD] [--direction asc|desc] [--item-type TYPE] [--trash]\n' +
+  '                                  # qmode=everything also matches a file\'s text and note bodies; such a hit is\n' +
+  '                                  # marked "only : content": it shows the term is in the file, not in the metadata\n' +
   '       node tools/zotero-read.mjs --item <key> [--offset N] [--limit N] [--grep TERM | --headings]\n' +
   '                                  # a note prints its body; --grep reads the paragraphs that mention a\n' +
   '                                  # term, --headings lists the note\'s own headings with their offsets\n' +
@@ -964,9 +1018,12 @@ async function runSearch(options) {
           includeTrashed: options.trash,
           total,
           hits: rows.length,
+          contentOnly: groups.filter((group) => !matchScope(group).includes('metadata')).length,
           records: groups.map((group) => ({
             key: group.parentKey,
             ref: itemRef(group.parentKey, options.library),
+            matchScope: matchScope(group),
+            contentOnly: !matchScope(group).includes('metadata'),
             sources: group.sources,
             record: group.record,
           })),
@@ -996,6 +1053,18 @@ async function runSearch(options) {
     console.log('mode    : titleCreatorYear searches titles, creators and years only - a paper whose text')
     console.log('          contains the term but whose title does not will look absent. Say so if you report it.')
   }
+  const contentOnly = groups.filter((group) => !matchScope(group).includes('metadata'))
+  if (contentOnly.length > 0) {
+    console.log(
+      `content : ${contentOnly.length} of these were answered by a file or note row, not by the record's own row -`,
+    )
+    console.log('          what that shows is that the term is in the file, not that the title or authors carry')
+    console.log('          it. The library never says why it matched, so results marked `only : content` below')
+    console.log('          are "I hold this", not "this is about that".')
+    console.log(
+      `next    : node tools/zotero-read.mjs --search ${shellWord(options.value)} --qmode titleCreatorYear   # the narrower question: titles, creators, years`,
+    )
+  }
   if (groups.length === 0) {
     console.log('\n0 records - the query was answered and matched nothing. This is not a failure.')
     return
@@ -1015,6 +1084,12 @@ async function runSearch(options) {
         : `${source.kind} ${source.key}${source.contentType ? ` (${source.contentType})` : ''}`,
     )
     console.log(`   hit  : ${parts.join(' · ')}`)
+    if (!matchScope(group).includes('metadata')) {
+      console.log("   only : answered by its file's text, not by the record's own row - no claim about its title here")
+      if (metadataMentions(record, options.value)) {
+        console.log('   also : its title, abstract or creators carry the query too, so this is not a body-only hit')
+      }
+    }
   })
 }
 

@@ -25,6 +25,8 @@ import {
   findPassages,
   groupHits,
   itemForJson,
+  matchScope,
+  metadataMentions,
   noteHeadings,
   normalizeTitle,
   parseArgs,
@@ -149,6 +151,36 @@ check(
   groupHits([SEARCH_ROWS[0], SEARCH_ROWS[0]]).length === 1,
   'the same row twice is still one record',
 )
+
+// --- where a record matched -----------------------------------------------------------------------
+
+console.log('\n[2b] a record says whether the query was in its metadata or only in its text')
+
+check(matchScope(notes) === 'metadata+notes', 'a record that matched by metadata and by two notes says both', matchScope(notes))
+const textOnlyGroup = groups.filter((group) => group.record === null)[0]
+check(matchScope(textOnlyGroup) === 'text', 'an attachment-only record says its text matched', matchScope(textOnlyGroup))
+check(
+  matchScope({ sources: [{ kind: 'item' }, { kind: 'attachment' }] }) === 'metadata+text',
+  'metadata beside a file is still a metadata hit',
+)
+check(matchScope({ sources: [{ kind: 'note' }, { kind: 'attachment' }] }) === 'notes+text', 'notes and a file are named in that order')
+check(matchScope({ sources: [] }) === 'unknown', 'no rows is unknown, not an invented reason')
+check(
+  !matchScope(textOnlyGroup).includes('metadata'),
+  'a text hit never claims the record\'s title matched - the whole point of the line',
+)
+check(
+  metadataMentions({ title: 'Seismic fragility of substations' }, 'substation'),
+  'the record is checked, so a file-row hit whose title does carry the query is known to be one',
+)
+check(
+  metadataMentions({ creators: [{ lastName: 'Ahumada', firstName: 'Nicolás' }] }, 'ahumada'),
+  'a creator\'s name counts as the record carrying the query',
+)
+check(metadataMentions({ abstractNote: 'Fragility &amp; short circuits' }, 'short circuit'), 'and so does the abstract')
+check(metadataMentions({ title: 'Probability-based seismic reliability' }, 'probability based seismic'), 'punctuation is normalised, not compared literally')
+check(!metadataMentions({ title: 'A paper about bridges' }, 'vulnerability'), 'a miss says nothing, and prints nothing')
+check(!metadataMentions(null, 'anything') && !metadataMentions({ title: 'x' }, ''), 'no record or no query is never a claim')
 
 // --- the year is found, never sliced ------------------------------------------------------------
 
