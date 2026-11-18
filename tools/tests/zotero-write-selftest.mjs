@@ -207,6 +207,18 @@ check(
   splitWholeName({ given: 'Juan Carlos', family: 'de la Llera' }).lastName === 'de la Llera',
   'a family name with spaces and a given name beside it is kept whole',
 )
+const commaForm = splitWholeName({ family: 'de la Llera, Juan Carlos' })
+check(
+  commaForm.lastName === 'de la Llera' && commaForm.firstName === 'Juan Carlos',
+  'the Last, First form is split at the comma, not at the last space',
+  `${commaForm.firstName} | ${commaForm.lastName}`,
+)
+const plainComma = splitWholeName({ family: 'Smith, John' })
+check(
+  plainComma.lastName === 'Smith' && plainComma.firstName === 'John',
+  'and a two-word form with a comma follows the same rule',
+  `${plainComma.firstName} | ${plainComma.lastName}`,
+)
 
 const empty = emptyFieldNames({ itemType: 'journalArticle', creators: [], title: 'A', DOI: '', volume: '', issue: '' })
 check(empty.join(', ') === 'DOI, volume, issue', 'the empty fields are named in payload order', empty.join(', '))
@@ -246,6 +258,7 @@ const crossrefRecord = {
     author: [
       { given: 'Nicolás', family: 'Ahumada' },
       { family: 'Deyu Cai' },
+      { family: 'de la Llera, Juan Carlos' },
       { name: 'IEEE Power Group' },
       { given: 'F.', family: 'Capitanescu' },
     ],
@@ -526,6 +539,15 @@ check(!crossref.stdout.includes('&amp;'), 'and no entity survives into the plan'
 check(crossref.stdout.includes('Fragility & short circuit faults.'), 'nor into the abstract, whose markup tags are dropped')
 check(crossref.stdout.includes('name ?'), 'a creator that arrived as one string is called out')
 check(crossref.stdout.includes('Cai, Deyu'), 'and split with the last word as the family name')
+check(
+  crossref.stdout.includes('de la Llera, Juan Carlos'),
+  'a deposit that wrote Last, First is split at the comma and still named in the warning',
+  crossref.stdout,
+)
+check(
+  crossref.stdout.includes('the family name came from the comma where one was given, and from the last word otherwise'),
+  'and the warning says which rule each of the two shapes got, rather than claiming one rule for both',
+)
 check(
   crossref.stdout.includes('carry initials only') && crossref.stdout.includes('Capitanescu, F.'),
   'a creator the deposit spelled with initials is called out, so "F." is not read as a full given name',

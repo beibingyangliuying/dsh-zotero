@@ -486,6 +486,9 @@ const USAGE =
   '       [--library user:0|group:<id>] [--json]\n' +
   '       --find-doi answers by identifier, and a candidate whose DOI field is EMPTY is listed apart\n' +
   '       from one that carries a different DOI: neither confirms nor denies the work, so both are shown.\n' +
+  '       When nothing carries the DOI, the one query that leaves the machine is made: the DOI is\n' +
+  '       looked up at api.crossref.org for its registered title, and that title is searched instead\n' +
+  '       (8 s, and a failure simply answers nothing) - an empty DOI field hides a held record often.\n' +
   '       --match prints, under each MISSING reference, the command that would fetch and create it - a\n' +
   '       dry run; add --write to the printed command to create the record.\n' +
   '       --limit counts ROWS for a search (at most 100, the library\'s page size) and CHARACTERS for a\n' +
@@ -2095,41 +2098,136 @@ export function doiCandidates(listed, target) {
   }
 }
 
-/** The items in this library that carry the DOI asked for, and the candidates that cannot be settled. */
-async function runFindDoi(options) {
-  const target = sameDoi(options.value)
-  if (target === '') throw new UsageError('--find-doi needs a DOI')
-  const params = new URLSearchParams({
-    q: options.value,
-    qmode: 'everything',
-    format: 'json',
-    limit: String(options.limit),
-  })
-  const { rows, total } = await paginatedJson(`${libraryPrefix(options.library)}/items?${params}`)
+/** The rows a text search returns, and how many the library says match in total. */
+async function textSearchRows(term, qmode, limit, library) {
+  const params = new URLSearchParams({ q: term, qmode, format: 'json', limit: String(limit) })
+  return paginatedJson(`${libraryPrefix(library)}/items?${params}`)
+}
+
+/** The records a text search answered with, with the DOI field as the record spells it. */
+async function listedCandidates(rows, library) {
   const groups = groupHits(rows)
   const missing = groups.filter((group) => !group.record).map((group) => group.parentKey)
-  const fetched = missing.length > 0 ? await recordsByKey(missing, options.library) : new Map()
+  const fetched = missing.length > 0 ? await recordsByKey(missing, library) : new Map()
   for (const group of groups) if (!group.record && fetched.has(group.parentKey)) group.record = fetched.get(group.parentKey)
-  const listed = groups
+  return groups
     .filter((group) => group.record !== undefined && group.record !== null)
     .map((group) => ({
       key: group.parentKey,
-      ref: itemRef(group.parentKey, options.library),
+      ref: itemRef(group.parentKey, library),
       title: group.record?.title ?? '',
       itemType: group.record?.itemType ?? '',
       doi: String(group.record?.DOI ?? '').trim(),
     }))
-  const { matches, withoutDoi, otherDoi } = doiCandidates(listed, target)
+}
+
+const CROSSREF_WORKS = 'https://api.crossref.org/works'
+const REGISTRY_TITLE_TIMEOUT_MS = 8_000
+
+/**
+ * The title the registry records for a DOI, or '' when the registry cannot be asked.
+ *
+ * A miss, a timeout and an unreachable network all answer '', because the caller uses this only to
+ * widen a search: a library answer must not become a refusal because Crossref was slow.
+ *
+ * @param {string} doi The DOI, in any of the forms a reader copies.
+ * @param {{timeoutMs?: number}} [options] How long to wait for the registry.
+ * @returns {Promise<string>} The registered title, or ''.
+ */
+export async function registryTitleOf(doi, { timeoutMs = REGISTRY_TITLE_TIMEOUT_MS } = {}) {
+  const path = String(doi)
+    .split('/')
+    .map((part) => encodeURIComponent(part))
+    .join('/')
+  try {
+    const response = await fetch(`${CROSSREF_WORKS}/${path}`, {
+      headers: { accept: 'application/json' },
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    if (!response.ok) return ''
+    const body = await response.json()
+    const value = body?.message?.title
+    const title = Array.isArray(value) ? value[0] : value
+    return String(title ?? '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .replace(/[.:;,]$/, '')
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * The candidate list after a second search widened it, with the three buckets recounted.
+ *
+ * A work the library holds may be reachable by title but not by DOI (an empty DOI field), so the
+ * widened list is merged by key before it is recounted: one record must not appear twice.
+ *
+ * @param {Array<{key: string, title: string, itemType: string, doi: string}>} listed Candidates already found.
+ * @param {Array<{key: string, title: string, itemType: string, doi: string}>} extra Candidates a wider search added.
+ * @param {string} target The DOI asked for, as sameDoi() renders it.
+ * @returns {{listed: Array<object>, matches: Array<object>, withoutDoi: Array<object>, otherDoi: Array<object>}}
+ */
+export function mergedCandidates(listed, extra, target) {
+  const known = new Set(listed.map((entry) => entry.key))
+  const merged = listed.concat(extra.filter((entry) => !known.has(entry.key)))
+  return { listed: merged, ...doiCandidates(merged, target) }
+}
+
+/** The items in this library that carry the DOI asked for, and the candidates that cannot be settled. */
+async function runFindDoi(options) {
+  const target = sameDoi(options.value)
+  if (target === '') throw new UsageError('--find-doi needs a DOI')
+  const doiSearch = await textSearchRows(options.value, 'everything', options.limit, options.library)
+  const doiListed = await listedCandidates(doiSearch.rows, options.library)
+  let listed = doiListed.slice()
+  let { matches, withoutDoi, otherDoi } = doiCandidates(listed, target)
+
+  // A DOI is only one way a library can hold a work. A record whose DOI field was never filled in
+  // does not contain the string, so the search above cannot reach it - and reporting "not found"
+  // about a record sitting in the library under a half-filled entry is exactly the mistake this
+  // mode must not make. Ask the registry what the work is called, then look that title up.
+  let byTitle = null
+  if (matches.length === 0) {
+    const title = await registryTitleOf(target)
+    if (title !== '') {
+      const titleSearch = await textSearchRows(title, 'titleCreatorYear', options.limit, options.library)
+      const extra = await listedCandidates(titleSearch.rows, options.library)
+      byTitle = { title, found: extra.filter((entry) => !listed.some((known) => known.key === entry.key)).length }
+      ;({ listed, matches, withoutDoi, otherDoi } = mergedCandidates(listed, extra, target))
+    }
+  }
 
   if (options.json) {
-    console.log(JSON.stringify({ doi: target, library: options.library, searched: total, matches, withoutDoi, otherDoi }, null, 2))
+    console.log(
+      JSON.stringify(
+        {
+          doi: target,
+          library: options.library,
+          searched: doiSearch.total,
+          titleLookup: byTitle,
+          matches,
+          withoutDoi,
+          otherDoi,
+        },
+        null,
+        2,
+      ),
+    )
     return
   }
   console.log(`doi     : ${target}`)
-  console.log(`searched: ${listed.length} of ${total} candidate(s) from a text search`)
+  console.log(`searched: ${doiListed.length} of ${doiSearch.total} candidate(s) from the DOI text search`)
   console.log(
     `carries : ${matches.length} with that DOI · ${withoutDoi.length} with no DOI field · ${otherDoi.length} with a different DOI`,
   )
+  if (byTitle !== null) {
+    console.log(
+      `by title: no record carries that DOI, so the registry title "${byTitle.title}" was searched instead${
+        byTitle.found === 0 ? ' - and it found nothing either' : ` (${byTitle.found} more candidate(s))`
+      }`,
+    )
+  }
   for (const match of matches) console.log(`match   : ${match.key}  ${match.ref}  ${match.itemType}  ${match.title}`)
   if (withoutDoi.length > 0) {
     console.log('')
@@ -2143,12 +2241,19 @@ async function runFindDoi(options) {
   }
   if (matches.length === 0) {
     console.log('')
-    console.log('NOT FOUND by identifier - this is not a failure, and not proof of absence.')
+    // The hedge and the pointer answer different questions, so a no-DOI candidate must not replace
+    // "cannot prove absence" with "is probably this one": both sentences are printed.
     console.log(
-      listed.length === 0
-        ? 'The text search found no candidate at all.'
-        : 'The candidates above are what a text search turned up; read one to settle it.',
+      'NOT FOUND by identifier - this is not a failure, and not proof of absence.' +
+        (withoutDoi.length > 0 ? ' The records under "no DOI" above are what it could still be: read one.' : ''),
     )
+    if (withoutDoi.length === 0) {
+      console.log(
+        listed.length === 0
+          ? 'The text search found no candidate at all.'
+          : 'The candidates above are what a text search turned up; read one to settle it.',
+      )
+    }
   }
   console.log('hint    : --item <key> reads one; --match <file> answers a whole reference list, by DOI or title.')
 }

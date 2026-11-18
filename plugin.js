@@ -36,7 +36,7 @@ const PACKAGE_ROOT = fileURLToPath(new URL('./', import.meta.url))
 const CATALOG = [
   {
     program: 'zotero-read',
-    purpose: 'read the library: full-text search, one item or note, batch reads by key, BM25 passages, collections, item-type schema, change cursor, DOI lookup, and reference reconciliation against BibTeX/JSON',
+    purpose: 'read the library: full-text search, one item or note, batch reads by key, BM25 passages, collections, item-type schema, change cursor, DOI lookup (widened by the registered title when the identifier matches nothing), and reference reconciliation against BibTeX/JSON',
     example: ['--search', 'seismic risk', '--limit', '10'],
   },
   {

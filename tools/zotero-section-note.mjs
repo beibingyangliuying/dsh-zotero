@@ -76,7 +76,7 @@
 //
 // Exit codes: 0 applied and read back, or nothing to do | 1 refused, and nothing was written |
 // 2 usage | 3 sent or written but NOT confirmed - the note may exist, so never resend it.
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { UsageError, reportFailure, reportHelp, wantsHelp } from './refusal.mjs'
@@ -1160,9 +1160,12 @@ async function runCreate(options) {
  * Create the notes a manifest lists, one entry at a time.
  *
  * Each entry goes through the same read, refusal and read-back as a single `--section`, so a batch is
- * not a faster channel - it is the same channel with the process started once. The run stops at the
- * first entry that does not read back, because a batch that keeps writing past an unconfirmed write
- * produces a record whose state no summary can describe.
+ * not a faster channel - it is the same channel with the process started once. An entry whose file is
+ * missing is skipped and the run continues, because nothing was sent and the write run would have
+ * stopped there for a reason that has nothing to do with the library. Otherwise the run stops at the
+ * first entry that does not come back clean, dry run included, so a plan shows the same stopping
+ * point the write would: a batch that keeps writing past an unconfirmed write produces a record whose
+ * state no summary can describe.
  */
 async function runBatch(options) {
   let source
@@ -1175,8 +1178,18 @@ async function runBatch(options) {
   console.log(`batch   : ${entries.length} entries from ${options.batch}`)
   console.log(`write   : ${options.write ? 'each entry in turn, stopping at the first one that is not confirmed' : 'none - this is a dry run'}`)
   const done = []
+  const failed = []
   for (const [index, entry] of entries.entries()) {
+    const where = `${entry.item} §${entry.section}`
     console.log(`\n--- ${index + 1}/${entries.length}  ${entry.item}  §${entry.section}`)
+    if (entry.file && !existsSync(entry.file)) {
+      // The path is read relative to the manifest, so a mistyped one has to be visible here rather
+      // than half-way through the run: a Windows path is C:/Users/..., not /c/Users/...
+      console.log(`file    : ${entry.file}  (NOT FOUND - write C:/Users/..., not /c/Users/...; skipped)`)
+      failed.push(`${where} (file not found)`)
+      continue
+    }
+    if (entry.file) console.log(`file    : ${entry.file}`)
     process.exitCode = 0
     await runCreate({ ...entry, write: options.write, plan: false, json: false })
     const code = process.exitCode ?? 0
@@ -1185,11 +1198,17 @@ async function runBatch(options) {
       console.log(`done    : ${done.length ? done.map((row) => `${row.item} §${row.section}`).join(' · ') : 'none'}`)
       const left = entries.slice(index + 1)
       if (left.length) console.log(`skipped : ${left.map((row) => `${row.item} §${row.section}`).join(' · ')} - not attempted`)
+      if (failed.length) console.log(`failed  : ${failed.join(' · ')}`)
+      process.exitCode = code
       return
     }
     done.push(entry)
   }
   console.log(`\nbatch   : ${done.length} of ${entries.length} ${options.write ? 'written and read back' : 'planned and clean'}.`)
+  if (failed.length) {
+    console.log(`failed  : ${failed.join(' · ')} - nothing was sent for these`)
+    process.exitCode = 1
+  }
 }
 
 /**

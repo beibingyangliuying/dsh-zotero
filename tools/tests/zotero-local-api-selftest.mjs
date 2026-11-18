@@ -27,6 +27,7 @@ import {
   createdItemKey,
   createWriteGate,
   emptyGrantStore,
+  encodeApiPath,
   grantFilePath,
   isWriteAccepted,
   keptGrant,
@@ -465,6 +466,16 @@ try {
 }
 check(pointedMessage.includes('C:/keys/zotero-local-api-key.json'), 'the grant file is named when the store has one')
 check(/other library id/.test(pointedMessage), 'and a key kept for another library is not mistaken for this one')
+
+console.log('\n[15] a path is encoded before it is sent, so a name in it is a request and not a mystery')
+
+const pathSame = (asked, expected, label) => check(encodeApiPath(asked) === expected, label, encodeApiPath(asked))
+pathSame('/api/users/0/items/ABCD2345', '/api/users/0/items/ABCD2345', 'a key path is unchanged')
+pathSame('/api/users/0/items/a b', '/api/users/0/items/a%20b', 'a space is escaped and the slashes stay separators')
+pathSame('/api/users/0/items/中文', '/api/users/0/items/%E4%B8%AD%E6%96%87', 'a non-ASCII segment is escaped')
+pathSame('/api/users/0/items?q=a%20b&limit=5', '/api/users/0/items?q=a%20b&limit=5', 'a query string is left as it was built')
+pathSame('/api/users/0/items/a%20b', '/api/users/0/items/a%20b', 'an already-encoded segment is not escaped twice')
+pathSame('/api/users/0/items/100%', '/api/users/0/items/100%25', 'a lone percent is escaped rather than throwing')
 
 console.log(`\n${failures === 0 ? 'PASS' : `FAIL (${failures})`}`)
 process.exit(failures === 0 ? 0 : 1)

@@ -370,16 +370,21 @@ async function metadataFromCrossref(doi) {
     if (a.name) return { creatorType: 'author', name: decodeEntities(a.name) }
     const { firstName, lastName } = splitWholeName(a)
     if (String(a.given ?? '').trim() === '' && /\s/.test(String(a.family ?? '').trim())) {
-      wholeNames.push(`${lastName}, ${firstName}`)
+      wholeNames.push({ shown: `${lastName}, ${firstName}`, comma: String(a.family ?? '').indexOf(',') > 0 })
     }
     if (isInitialsOnly(a.given)) initialNames.push([lastName, firstName].filter(Boolean).join(', '))
     return { creatorType: 'author', firstName, lastName }
   })
   const warnings = []
   if (wholeNames.length) {
+    const shown = wholeNames.map((entry) => entry.shown)
+    const readAs = wholeNames.every((entry) => entry.comma)
+      ? 'the part before the comma was taken as the family name'
+      : wholeNames.every((entry) => !entry.comma)
+        ? 'the last word was taken as the family name'
+        : 'the family name came from the comma where one was given, and from the last word otherwise'
     warnings.push(
-      `name ? : ${wholeNames.length} creator(s) arrived as one string (${wholeNames.join(' · ')}); the last word was ` +
-        'taken as the family name — check the order before citing it',
+      `name ? : ${wholeNames.length} creator(s) arrived as one string (${shown.join(' · ')}); ${readAs} — check the order before citing it`,
     )
   }
   if (initialNames.length) {
@@ -388,8 +393,12 @@ async function metadataFromCrossref(doi) {
         'deposit does not spell those given names out, so check the author page before citing it',
     )
   }
+  // A serial carries an ISSN and a meeting does not; a journal whose name begins with "Proceedings"
+  // (Proceedings of the IEEE) is therefore a journal, and hinting otherwise would invite a wrong type.
   const looksConference =
-    Boolean(m.event?.name) || (m.ISBN?.length ?? 0) > 0 || /proceedings|conference|symposium|congress|workshop/i.test(container)
+    Boolean(m.event?.name) ||
+    (m.ISBN?.length ?? 0) > 0 ||
+    ((m.ISSN?.length ?? 0) === 0 && /proceedings|conference|symposium|congress|workshop/i.test(container))
   if (looksConference && value('item-type') === null) {
     warnings.push(
       `type ? : this reads like a conference paper (${m.event?.name ? `event "${m.event.name}"` : (m.ISBN?.length ?? 0) > 0 ? 'it carries an ISBN' : `the container is "${container}"`}); ` +
@@ -417,18 +426,25 @@ async function metadataFromCrossref(doi) {
 /**
  * Split a creator whose name arrived as one string, the way depositors sometimes send it.
  *
- * `family: "Deyu Cai"` with no `given` is one name written whole, not a two-word family name; the
- * usual deposit convention is family-then-given, but a deposit that writes it whole is far more often
- * given-then-family. Reading it verbatim puts the whole name in the family slot, which is what a
- * citation then prints. A single word is left alone: it has no split to make.
+ * Two shapes arrive this way. `family: "de la Llera, Juan Carlos"` is the `Last, First` form — the
+ * same way a reader writes creators, and the form the rest of this suite takes for `--set-creators` —
+ * so the part before the comma is the family name and nothing is guessed. `family: "Deyu Cai"` has no
+ * comma and is one name written whole, not a two-word family name: a deposit that writes a name whole
+ * is far more often given-then-family, so the last word becomes the family name. Reading either shape
+ * verbatim would put the whole name in the family slot, which is what a citation then prints. A single
+ * word is left alone: it has no split to make.
  *
  * @param {{given?: string, family?: string}} creator One author as Crossref sent it.
- * @returns {{firstName: string, lastName: string}} The two slots, with the last word as the family name.
+ * @returns {{firstName: string, lastName: string}} The two slots, split by the comma when there is one
+ *   and otherwise with the last word as the family name.
  */
 export function splitWholeName(creator) {
   const given = String(creator?.given ?? '').trim()
   const family = String(creator?.family ?? '').trim()
-  if (given !== '' || !/\s/.test(family)) return { firstName: given, lastName: family }
+  if (given !== '') return { firstName: given, lastName: family }
+  const comma = family.indexOf(',')
+  if (comma > 0) return { firstName: family.slice(comma + 1).trim(), lastName: family.slice(0, comma).trim() }
+  if (!/\s/.test(family)) return { firstName: '', lastName: family }
   const words = family.split(/\s+/)
   return { firstName: words.slice(0, -1).join(' '), lastName: words.at(-1) }
 }

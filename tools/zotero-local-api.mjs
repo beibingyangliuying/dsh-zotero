@@ -357,6 +357,34 @@ const noop = () => {}
 /** Wait `ms` without a timer object to clean up. */
 const delay = (ms) => new Promise((done) => setTimeout(done, ms))
 
+/**
+ * A path the local API can be asked for, with every segment percent-encoded.
+ *
+ * The HTTP client refuses a path carrying a character it cannot put on the wire, and the error it
+ * raises - "Request path contains unescaped characters" - names neither the caller nor the path, so a
+ * single unencoded segment reads as a bug in whichever command happened to try it first. Keys and ids
+ * are ASCII, so this changes nothing today; it is here so that the day a title, a name, or a
+ * hand-built query value reaches the path, that day is a working request rather than a mystery.
+ *
+ * A segment that is already encoded is decoded and re-encoded, so nothing is escaped twice, and a
+ * query string is left exactly as the caller built it.
+ *
+ * @param {string} path A path beginning with `/api/`, with or without a query string.
+ * @returns {string} The same path, safe to send.
+ */
+export function encodeApiPath(path) {
+  const [head, ...tail] = String(path ?? '').split('?')
+  const query = tail.length > 0 ? `?${tail.join('?')}` : ''
+  const segments = head.split('/').map((segment) => {
+    try {
+      return encodeURIComponent(decodeURIComponent(segment))
+    } catch {
+      return encodeURIComponent(segment)
+    }
+  })
+  return segments.join('/') + query
+}
+
 /** The tail of the queue every request joins, so only one connection is open at a time. */
 let queue = Promise.resolve()
 
@@ -453,7 +481,7 @@ function sendOnce(method, path, { body, headers = {}, timeoutMs = 0 } = {}) {
     const req = request(
       {
         ...localOrigin(),
-        path,
+        path: encodeApiPath(path),
         method,
         headers: { ...headers, ...(body ? { 'Content-Length': Buffer.byteLength(body) } : {}) },
       },

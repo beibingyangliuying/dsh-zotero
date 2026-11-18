@@ -779,6 +779,23 @@ check(
   'both notes carry the claims the manifest named',
 )
 
+// A mistyped path is not a reason to abandon the other entries: nothing was sent for it, so the run
+// names it and carries on - and the exit code still says the batch was not complete.
+const badPathManifest = join(batchDir, 'missing.json')
+writeFileSync(
+  badPathManifest,
+  JSON.stringify([
+    { item: 'REC2', section: '7', file: join(batchDir, 'not-here.html') },
+    { item: 'REC2', section: '8', text: '<p>第8节</p>' },
+  ]),
+  'utf8',
+)
+const missingDry = await runAsync(['--batch', badPathManifest])
+same(missingDry.status, 1, 'a missing file fails the batch rather than passing it')
+check(missingDry.stdout.includes('(NOT FOUND'), 'the path is named where it cannot be found', missingDry.stdout)
+check(missingDry.stdout.includes('--- 2/2  REC2  §8'), 'and the entry after it is still planned', missingDry.stdout)
+check(missingDry.stdout.includes('failed  : REC2 §7 (file not found)'), 'the summary says what was skipped', missingDry.stdout)
+
 const stopManifest = join(batchDir, 'stop.json')
 writeFileSync(
   stopManifest,

@@ -158,6 +158,10 @@ export function headingCandidates(text) {
   ]
   const titleShaped = (title) => {
     if (title.split(' ').length > 16) return false
+    // A line that opens with a symbol, or carries a formula operator, is a fragment of an equation
+    // that happened to begin with a number: "1 − λ", "0.95 $0.5 bil". No heading opens that way.
+    if (!/^[\p{L}]/u.test(title)) return false
+    if (/[=≤≥±×→←∑∫√$]/.test(title)) return false
     if (/^[a-z]/.test(title)) return false
     if (/[.,;:!?、，；：！？]$/.test(title)) return false
     if (/\.\s/.test(title)) return false

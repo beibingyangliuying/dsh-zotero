@@ -197,6 +197,12 @@ check(
   'the same number twice keeps the first title, because a repeated heading is a page header',
 )
 same(headingCandidates('').length, 0, 'no text means no candidates rather than a guess')
+
+// An equation that happens to start with a number is not a heading, and a real preprint is full of
+// them: "1 − λ", "0.95 $0.5 bil". The line must open with a letter and carry no formula operator.
+const fragments = headingCandidates(['1 − λ', '0.95 $0.5 bil reduction', '2 ≤ x', '3 = a + b', '4 Selected results'].join('\n'))
+same(fragments.length, 1, 'only the line that reads as words survives', String(fragments.length))
+same(fragments[0].title, 'Selected results', 'and it is the one with a title')
 check(
   /headingCandidates\(\(await extractPdfText\(bytes\)\)\.text\)/.test(toolSource),
   'the outline rung falls back to the text it can read, not to a pattern over the PDF bytes',

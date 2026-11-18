@@ -42,7 +42,7 @@ dsh plugin --profile web add github:beibingyangliuying/dsh-zotero#v0.4.0
 
 | 文件 | 用途 |
 |---|---|
-| `zotero-read.mjs` | 检索、读条目、批量读、参考文献对账、全文切片、合集与标签 |
+| `zotero-read.mjs` | 检索、读条目、批量读、参考文献对账、全文切片、合集与标签、DOI 查询（零命中时回查登记处标题） |
 | `zotero-write.mjs` | 新增条目（DOI / arXiv / 手工字段 / 笔记），默认 dry run |
 | `zotero-edit.mjs` | 字段、作者表与标签编辑（可批量）、单条记录删除、回收站恢复、改笔记、删库级标签 |
 | `zotero-remark.mjs` | 只换 remark 那一行，必须背出旧值 |

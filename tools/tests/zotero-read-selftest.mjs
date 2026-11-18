@@ -41,6 +41,8 @@ import {
   referenceFromEntry,
   sameDoi,
   screenRows,
+  mergedCandidates,
+  registryTitleOf,
   selectRequested,
   shortCreators,
   sliceText,
@@ -673,5 +675,69 @@ throws('--format is not accepted outside --match', () => parseArgs(['--search', 
 check(parseArgs(['--match', 'refs.json']).format === 'json', 'a .json path defaults to the JSON reader')
 check(parseArgs(['--match', '-']).format === 'bibtex', 'stdin defaults to BibTeX')
 
+console.log('\n[20] a DOI miss is widened by the registry title, because an empty DOI field hides a held record')
+
+const withRealFetch = globalThis.fetch
+const stubFetch = (answer) => {
+  const calls = []
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), init })
+    return answer(String(url), init)
+  }
+  return calls
+}
+const jsonAnswer = (body, status = 200) => () => ({ ok: status >= 200 && status < 300, status, json: async () => body })
+const answering = async (label, answer, then) => {
+  const calls = stubFetch(answer)
+  try {
+    await then(calls)
+  } catch (error) {
+    check(false, label, String(error))
+  } finally {
+    globalThis.fetch = withRealFetch
+  }
+}
+
+await answering('the registry title is read, tidied, and one short', jsonAnswer({ message: { title: ['  Attention is all you need.  '] } }), async () => {
+  const title = await registryTitleOf('10.1000/abc')
+  check(title === 'Attention is all you need', 'the registered title is returned without its closing period', JSON.stringify(title))
+})
+
+await answering('a title the registry stores as a bare string is read too', jsonAnswer({ message: { title: 'A sparse deposit' } }), async () => {
+  check((await registryTitleOf('10.1000/abc')) === 'A sparse deposit', 'a string title is accepted')
+})
+
+await answering('the DOI is encoded one segment at a time, so its slash stays a path', jsonAnswer({ message: { title: ['X'] } }), async (calls) => {
+  await registryTitleOf('10.1016/a b#c')
+  check(calls[0].url.endsWith('/10.1016/a%20b%23c'), 'a space and a fragment marker are escaped, the slash is not', calls[0].url)
+  check(calls[0].init?.signal !== undefined, 'the request carries a timeout signal')
+})
+
+await answering('a registry miss answers nothing rather than throwing', jsonAnswer({ message: {} }, 404), async () => {
+  check((await registryTitleOf('10.1000/missing')) === '', 'a 404 answers an empty title')
+})
+
+await answering('a registry that cannot be reached answers nothing either', () => {
+  throw new Error('getaddrinfo ENOTFOUND api.crossref.org')
+}, async () => {
+  check((await registryTitleOf('10.1000/abc')) === '', 'an unreachable registry answers an empty title')
+})
+
+await answering('a deposit with no title answers nothing', jsonAnswer({ message: {} }), async () => {
+  check((await registryTitleOf('10.1000/abc')) === '', 'a missing title answers an empty string')
+})
+
+const foundByDoi = [{ key: 'ABCD2345', ref: 'r1', title: 'Held', itemType: 'journalArticle', doi: '' }]
+const foundByTitle = [
+  { key: 'ABCD2345', ref: 'r1', title: 'Held', itemType: 'journalArticle', doi: '' },
+  { key: 'BCDE3456', ref: 'r2', title: 'Also held', itemType: 'journalArticle', doi: '' },
+]
+const widened = mergedCandidates(foundByDoi, foundByTitle, sameDoi('10.1000/abc'))
+check(widened.listed.length === 2, 'a record found by both searches is listed once', String(widened.listed.length))
+check(widened.withoutDoi.length === 2, 'both empty-DOI records are reported as undecidable, not as absent', String(widened.withoutDoi.length))
+check(widened.matches.length === 0, 'neither is claimed to carry the DOI')
+check(mergedCandidates([], [{ key: 'ABCD2345', ref: 'r1', title: 'Held', itemType: 'journalArticle', doi: '10.1000/ABC' }], sameDoi('10.1000/abc')).matches.length === 1, 'a DOI found by the wider search still matches despite its case')
+
 console.log(`\n${failures === 0 ? 'PASS' : `FAIL (${failures})`}`)
+
 process.exit(failures === 0 ? 0 : 1)
